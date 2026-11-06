@@ -1,4 +1,4 @@
-name: Generate Registry Catalog
+name: Generate Registry Catalog with Capability & Intent Footprints
 
 on:
   push:
@@ -15,32 +15,55 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build registry.json with Automated Capability Detection
+      - name: Build registry.json with Semantic Footprints
         run: |
           node -e '
           const fs = require("fs");
           const path = require("path");
 
-          // Automated Static Code Capability Classifier
-          function detectCapabilities(code) {
-            const caps = new Set();
+          // Extract commands registered via this.addCommand
+          function extractCommands(code) {
+            const cmds = [];
+            const regex = /name\\s*:\\s*["\x27\`]([^"\x27\`]+)["\x27\`]/g;
+            let m;
+            while ((m = regex.exec(code)) !== null) {
+              if (!cmds.includes(m[1].trim())) cmds.push(m[1].trim());
+            }
+            return cmds;
+          }
 
-            const hasNetwork = /\\bfetch\\s*\\(|\\bhttps?\\.|\\bWebSocket\\s*\\(|\\bXMLHttpRequest\\b|\\bnet\\./.test(code);
-            const hasShell = /\\bchild_process\\b|\\bexec\\s*\\(|\\bspawn\\s*\\(|\\bnode-pty\\b|\\bexecSync\\b/.test(code);
-            const hasAudio = /\\bnew\\s+Audio\\b|\\bAudioContext\\b|\\bwebkitAudioContext\\b|["'\\`]audio\\//.test(code);
-            const hasClipboard = /\\bclipboard\\.(read|write)|\\bnavigator\\.clipboard\\b/.test(code);
+          // Automated capability & feature token classification
+          function analyzeCode(code) {
+            const caps = new Set();
+            const features = new Set();
+
+            const hasNetwork = /\bfetch\s*\(|\bhttps?\.|\bWebSocket\s*\(|\bXMLHttpRequest\b|\bnet\./.test(code);
+            const hasShell = /\bchild_process\b|\bexec\s*\(|\bspawn\s*\(|\bnode-pty\b|\bexecSync\b/.test(code);
+            const hasAudio = /\bnew\s+Audio\b|\bAudioContext\b|\bwebkitAudioContext\b|["\x27\x60]audio\//.test(code);
+            const hasClipboard = /\bclipboard\.(read|write)|\bnavigator\.clipboard\b/.test(code);
+            const hasStatusBar = /statusBar\.addItem/.test(code);
+            const hasSettings = /addSettingTab/.test(code);
 
             if (hasNetwork) caps.add("network");
             if (hasShell) caps.add("shell");
-            if (hasAudio) caps.add("audio");
+            if (hasAudio) { caps.add("audio"); features.add("audio playback"); features.add("music player"); }
             if (hasClipboard) caps.add("clipboard");
+            if (hasStatusBar) { caps.add("status-bar"); features.add("status bar controls"); }
+            if (hasSettings) caps.add("settings");
 
-            // If neither network nor shell execution is detected, mark as vault-safe
-            if (!hasNetwork && !hasShell) {
-              caps.add("vault-only");
+            if (!hasNetwork && !hasShell) caps.add("vault-only");
+
+            // Look for common feature keywords in code comments and strings
+            const keywords = ["album", "playlist", "queue", "tag", "counter", "sort", "timer", "clock", "canvas", "drawing", "sync", "calendar", "task", "todo"];
+            const lowerCode = code.toLowerCase();
+            for (const kw of keywords) {
+              if (lowerCode.includes(kw)) features.add(kw);
             }
 
-            return Array.from(caps);
+            return {
+              capabilities: Array.from(caps),
+              features: Array.from(features)
+            };
           }
 
           const registry = [];
@@ -60,13 +83,13 @@ jobs:
                 const mainCode = fs.existsSync(mainJsPath) ? fs.readFileSync(mainJsPath, "utf-8") : "";
                 const files = fs.readdirSync(pluginPath).filter(f => !f.startsWith("."));
 
-                // Automatically infer capabilities from the code
-                const detectedCaps = detectCapabilities(mainCode);
+                const analysis = analyzeCode(mainCode);
+                const commands = extractCommands(mainCode);
 
                 registry.push({
                   id: manifest.id || dir.name,
                   name: manifest.name || dir.name,
-                  author: manifest.author || "Mirage Community",
+                  author: manifest.author || "Julian Ventura",
                   version: manifest.version || "1.0.0",
                   type: "plugin",
                   description: manifest.description || "",
@@ -74,7 +97,9 @@ jobs:
                   branch: "main",
                   path: `plugins/${dir.name}`,
                   files: files,
-                  capabilities: detectedCaps
+                  capabilities: analysis.capabilities,
+                  features: analysis.features,
+                  commands: commands
                 });
               }
             }
@@ -90,12 +115,12 @@ jobs:
               const scriptCode = fs.readFileSync(filePath, "utf-8");
               const baseName = path.basename(file, ".js");
 
-              const detectedCaps = detectCapabilities(scriptCode);
+              const analysis = analyzeCode(scriptCode);
 
               registry.push({
                 id: baseName.toLowerCase().replace(/[^a-z0-9_-]/g, "-"),
                 name: baseName.replace(/[-_]/g, " "),
-                author: "Mirage Community",
+                author: "Julian Ventura",
                 version: "1.0.0",
                 type: "script",
                 description: `User script: ${file}`,
@@ -103,13 +128,15 @@ jobs:
                 branch: "main",
                 path: `scripts/${file}`,
                 file: file,
-                capabilities: detectedCaps
+                capabilities: analysis.capabilities,
+                features: analysis.features,
+                commands: [baseName]
               });
             }
           }
 
           fs.writeFileSync("registry.json", JSON.stringify(registry, null, 2), "utf-8");
-          console.log(`✓ Automated capability detection complete. Generated registry.json with ${registry.length} entries.`);
+          console.log(`✓ Generated registry.json with ${registry.length} enriched entries.`);
           '
 
       - name: Commit & Push updated registry.json
@@ -117,5 +144,5 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add registry.json
-          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update registry.json with classified capabilities [skip ci]"
+          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update registry.json with semantic footprints [skip ci]"
           git push
