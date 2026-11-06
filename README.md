@@ -138,14 +138,17 @@ module.exports = async function(app) {
 
 ---
 
-## Security & Capabilities
+## Automated Security & Capability Badges
 
-To maintain user trust without requiring a centralized app store approval process, declare your extension's capabilities in `manifest.json`:
+When you submit a plugin or script, our automated registry scanner audits the code using static analysis to detect the APIs your extension uses and automatically applies badges in the Mirage Editor catalog:
 
-* **`vault-only`**: The extension only reads/writes within the active vault. No network activity and no shell execution.
-* **`audio`**: Uses web audio APIs or HTML5 audio playback.
-* **`network`**: Makes outbound HTTP/WebSocket requests (e.g. sync services, dictionary lookups, APIs).
-* **`shell`**: Executes system processes via terminal or shell runners.
+* **`🔒 Vault Safe`**: Assigned automatically to extensions that do not execute shell processes or open network sockets. Your notes stay strictly local.
+* **`🌐 Network`**: Detected if the extension calls `fetch()`, `http`, or `WebSocket` (e.g. sync services, dictionary lookups, external APIs).
+* **`⚡ Shell`**: Detected if the extension uses `child_process` or terminal runners.
+* **`🎵 Audio`**: Detected if the extension uses HTML5 Audio or Web Audio playback.
+* **`📋 Clipboard`**: Detected if the extension reads or writes to the system clipboard.
+
+This ensures complete transparency for users without adding administrative overhead for authors.
 
 ---
 
