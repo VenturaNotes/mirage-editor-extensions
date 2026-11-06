@@ -1,0 +1,28 @@
+[
+  {
+    "id": "lean-player",
+    "name": "Lean Player",
+    "author": "Julian Ventura",
+    "version": "1.0.0",
+    "type": "plugin",
+    "description": "Lightweight, zero-build local music player with queue management, global search, and status bar controls.",
+    "repo": "VenturaNotes/mirage-community-plugins",
+    "branch": "main",
+    "path": "plugins/lean-player",
+    "files": ["manifest.json", "main.js", "styles.css"],
+    "capabilities": ["vault-only", "audio"]
+  },
+  {
+    "id": "reading-time",
+    "name": "Reading Time & Word Counter",
+    "author": "Community",
+    "version": "1.0.0",
+    "type": "script",
+    "description": "Calculates word count, character count, and estimated reading time for the active note.",
+    "repo": "VenturaNotes/mirage-community-plugins",
+    "branch": "main",
+    "path": "scripts/readingTime.js",
+    "file": "readingTime.js",
+    "capabilities": ["vault-only"]
+  }
+]
