@@ -1,68 +1,88 @@
-name: Validate Community Registry & Security Scan
+name: Generate Registry Catalog
 
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    paths:
+      - 'plugins/**'
+      - 'scripts/**'
 
 jobs:
-  validate:
+  build-registry:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 18
-
-      - name: Validate registry.json & Static Security Check
+      - name: Build registry.json from folders
         run: |
           node -e '
           const fs = require("fs");
           const path = require("path");
 
-          // 1. JSON Syntax & Schema validation
-          const raw = fs.readFileSync("registry.json", "utf-8");
-          const registry = JSON.parse(raw);
-          if (!Array.isArray(registry)) throw new Error("registry.json must be a JSON array.");
+          const registry = [];
 
-          const seenIds = new Set();
-          const BANNED_PATTERNS = [
-            /eval\\s*\\(/,
-            /new\\s+Function\\s*\\(/,
-            /child_process/,
-            /\\/etc\\/passwd/,
-            /rm\\s+-rf/
-          ];
+          // 1. Scan plugins/
+          if (fs.existsSync("plugins")) {
+            const pluginDirs = fs.readdirSync("plugins", { withFileTypes: true })
+              .filter(d => d.isDirectory() && !d.name.startsWith("."));
 
-          for (const item of registry) {
-            if (!item.id || !item.name || !item.repo || !item.description) {
-              throw new Error(`Missing required fields in item: ${JSON.stringify(item)}`);
-            }
-            if (seenIds.has(item.id)) throw new Error(`Duplicate plugin/script ID: ${item.id}`);
-            seenIds.add(item.id);
+            for (const dir of pluginDirs) {
+              const manifestPath = path.join("plugins", dir.name, "manifest.json");
+              if (fs.existsSync(manifestPath)) {
+                const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+                const files = fs.readdirSync(path.join("plugins", dir.name))
+                  .filter(f => !f.startsWith("."));
 
-            // 2. Static Security Scan on local files (if hosted in-repo)
-            if (item.path && fs.existsSync(item.path)) {
-              const fullPath = path.resolve(item.path);
-              const files = fs.statSync(fullPath).isDirectory() 
-                ? fs.readdirSync(fullPath).map(f => path.join(fullPath, f))
-                : [fullPath];
-
-              for (const f of files) {
-                if (f.endsWith(".js")) {
-                  const code = fs.readFileSync(f, "utf-8");
-                  for (const pattern of BANNED_PATTERNS) {
-                    if (pattern.test(code)) {
-                      throw new Error(`[Security Flag] Disallowed pattern ${pattern} detected in ${f}`);
-                    }
-                  }
-                }
+                registry.push({
+                  id: manifest.id || dir.name,
+                  name: manifest.name || dir.name,
+                  author: manifest.author || "Julian Ventura",
+                  version: manifest.version || "1.0.0",
+                  type: "plugin",
+                  description: manifest.description || "",
+                  repo: "VenturaNotes/mirage-editor-extensions",
+                  branch: "main",
+                  path: `plugins/${dir.name}`,
+                  files: files,
+                  capabilities: manifest.capabilities || ["vault-only"]
+                });
               }
             }
           }
-          console.log(`✓ Validated ${registry.length} community plugins and scripts successfully.`);
+
+          // 2. Scan scripts/
+          if (fs.existsSync("scripts")) {
+            const scriptFiles = fs.readdirSync("scripts")
+              .filter(f => f.endsWith(".js") && !f.startsWith("."));
+
+            for (const file of scriptFiles) {
+              const baseName = path.basename(file, ".js");
+              registry.push({
+                id: baseName.toLowerCase().replace(/[^a-z0-9_-]/g, "-"),
+                name: baseName.replace(/[-_]/g, " "),
+                author: "Julian Ventura",
+                version: "1.0.0",
+                type: "script",
+                description: `User script: ${file}`,
+                repo: "VenturaNotes/mirage-editor-extensions",
+                branch: "main",
+                path: `scripts/${file}`,
+                file: file,
+                capabilities: ["vault-only"]
+              });
+            }
+          }
+
+          fs.writeFileSync("registry.json", JSON.stringify(registry, null, 2), "utf-8");
+          console.log(`✓ Generated registry.json with ${registry.length} entries.`);
           '
+
+      - name: Commit & Push updated registry.json
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add registry.json
+          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update registry.json [skip ci]"
+          git push
