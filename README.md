@@ -50,8 +50,7 @@ Create a folder inside `plugins/<your-plugin-id>/` with two required files:
   "description": "A clean description of what this extension adds.",
   "author": "Your Name",
   "prefix": "MyPlugin",
-  "main": "main.js",
-  "capabilities": ["vault-only"]
+  "main": "main.js"
 }
 ```
 
