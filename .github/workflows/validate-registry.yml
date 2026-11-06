@@ -1,4 +1,4 @@
-name: Generate Registry Catalog with Capability & Intent Footprints
+name: Generate Registry Catalog & AI Summarizer
 
 on:
   push:
@@ -15,134 +15,247 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build registry.json with Semantic Footprints
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build registry.json with 2-Tier Model Cascade & Retries
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           node -e '
           const fs = require("fs");
           const path = require("path");
 
-          // Extract commands registered via this.addCommand
-          function extractCommands(code) {
-            const cmds = [];
-            const regex = /name\\s*:\\s*["\x27\`]([^"\x27\`]+)["\x27\`]/g;
-            let m;
-            while ((m = regex.exec(code)) !== null) {
-              if (!cmds.includes(m[1].trim())) cmds.push(m[1].trim());
+          const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
+          // 2-Tier Model Cascade: Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite
+          const MODEL_CASCADE = [
+            { id: "gemini-3.5-flash-lite", name: "Gemini 3.5 Flash-Lite" },
+            { id: "gemini-3.1-flash-lite", name: "Gemini 3.1 Flash-Lite" }
+          ];
+
+          // 1. AST / Outline Extractor: Compresses code down to ~200 tokens
+          function extractStructuralOutline(code) {
+            const lines = code.split("\n");
+            const outline = [];
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (
+                trimmed.startsWith("class ") ||
+                trimmed.startsWith("async onload") ||
+                trimmed.startsWith("onunload") ||
+                trimmed.includes("addCommand(") ||
+                trimmed.includes("addSettingTab(") ||
+                trimmed.includes("name:") ||
+                trimmed.includes("statusBar.addItem") ||
+                trimmed.includes("new Audio") ||
+                trimmed.includes("fetch(") ||
+                trimmed.includes("child_process")
+              ) {
+                outline.push(trimmed);
+              }
             }
-            return cmds;
+            return outline.slice(0, 45).join("\n");
           }
 
-          // Automated capability & feature token classification
-          function analyzeCode(code) {
+          // 2. Baseline Static capability detection
+          function detectCapabilities(code) {
             const caps = new Set();
-            const features = new Set();
-
-            const hasNetwork = /\bfetch\s*\(|\bhttps?\.|\bWebSocket\s*\(|\bXMLHttpRequest\b|\bnet\./.test(code);
-            const hasShell = /\bchild_process\b|\bexec\s*\(|\bspawn\s*\(|\bnode-pty\b|\bexecSync\b/.test(code);
-            const hasAudio = /\bnew\s+Audio\b|\bAudioContext\b|\bwebkitAudioContext\b|["\x27\x60]audio\//.test(code);
-            const hasClipboard = /\bclipboard\.(read|write)|\bnavigator\.clipboard\b/.test(code);
-            const hasStatusBar = /statusBar\.addItem/.test(code);
-            const hasSettings = /addSettingTab/.test(code);
-
-            if (hasNetwork) caps.add("network");
-            if (hasShell) caps.add("shell");
-            if (hasAudio) { caps.add("audio"); features.add("audio playback"); features.add("music player"); }
-            if (hasClipboard) caps.add("clipboard");
-            if (hasStatusBar) { caps.add("status-bar"); features.add("status bar controls"); }
-            if (hasSettings) caps.add("settings");
-
-            if (!hasNetwork && !hasShell) caps.add("vault-only");
-
-            // Look for common feature keywords in code comments and strings
-            const keywords = ["album", "playlist", "queue", "tag", "counter", "sort", "timer", "clock", "canvas", "drawing", "sync", "calendar", "task", "todo"];
-            const lowerCode = code.toLowerCase();
-            for (const kw of keywords) {
-              if (lowerCode.includes(kw)) features.add(kw);
-            }
-
-            return {
-              capabilities: Array.from(caps),
-              features: Array.from(features)
-            };
+            if (/\bfetch\s*\(|\bhttps?\.|\bWebSocket\s*\(|\bXMLHttpRequest\b/.test(code)) caps.add("network");
+            if (/\bchild_process\b|\bexec\s*\(|\bspawn\s*\(|\bnode-pty\b/.test(code)) caps.add("shell");
+            if (/\bnew\s+Audio\b|\bAudioContext\b|["\x27\x60]audio\//.test(code)) caps.add("audio");
+            if (/\bclipboard\.(read|write)|\bnavigator\.clipboard\b/.test(code)) caps.add("clipboard");
+            if (/statusBar\.addItem/.test(code)) caps.add("status-bar");
+            if (!caps.has("network") && !caps.has("shell")) caps.add("vault-only");
+            return Array.from(caps);
           }
 
-          const registry = [];
+          // Helper: Sleep for exponential backoff
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-          // 1. Scan plugins/
-          if (fs.existsSync("plugins")) {
-            const pluginDirs = fs.readdirSync("plugins", { withFileTypes: true })
-              .filter(d => d.isDirectory() && !d.name.startsWith("."));
+          // 3. Cascading & Retrying Summarizer (3.5 Flash-Lite -> 3.1 Flash-Lite)
+          async function summarizeWithCascade(name, outline, existingDesc) {
+            if (!GEMINI_API_KEY) return null;
 
-            for (const dir of pluginDirs) {
-              const pluginPath = path.join("plugins", dir.name);
-              const manifestPath = path.join(pluginPath, "manifest.json");
-              const mainJsPath = path.join(pluginPath, "main.js");
+            const prompt = `Analyze this structural outline of a Mirage Editor extension named "${name}".
+          Outline:
+          ${outline}
 
-              if (fs.existsSync(manifestPath)) {
-                const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
-                const mainCode = fs.existsSync(mainJsPath) ? fs.readFileSync(mainJsPath, "utf-8") : "";
-                const files = fs.readdirSync(pluginPath).filter(f => !f.startsWith("."));
+          Respond ONLY with a JSON object:
+          {
+            "description": "${existingDesc ? existingDesc : 'A clear 1-2 sentence description of what it does.'}",
+            "features": ["feature 1", "feature 2", "feature 3"],
+            "readmeBullets": ["Bullet 1 explaining feature", "Bullet 2 explaining usage", "Bullet 3 explaining commands"]
+          }`;
 
-                const analysis = analyzeCode(mainCode);
-                const commands = extractCommands(mainCode);
+            // Loop through the 2-tier model cascade
+            for (let mIdx = 0; mIdx < MODEL_CASCADE.length; mIdx++) {
+              const model = MODEL_CASCADE[mIdx];
+              const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model.id}:generateContent?key=${GEMINI_API_KEY}`;
+              const maxAttempts = 3;
+
+              for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                  console.log(`[AI Summarizer] Querying ${model.name} for "${name}" (attempt ${attempt}/${maxAttempts})...`);
+
+                  const res = await fetch(endpoint, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      contents: [{ parts: [{ text: prompt }] }],
+                      generationConfig: { responseMimeType: "application/json" }
+                    })
+                  });
+
+                  // Handle Rate Limits / Quotas (429)
+                  if (res.status === 429) {
+                    console.warn(`[AI Summarizer] 429 Rate limit on ${model.name}.`);
+                    if (mIdx < MODEL_CASCADE.length - 1) {
+                      console.log(`[AI Summarizer] Cascading to next model: ${MODEL_CASCADE[mIdx + 1].name}...`);
+                      break; // Break retry loop to cascade to next tier
+                    } else {
+                      // Last model tier: backoff and retry
+                      const backoff = Math.min(3000 * attempt, 15000);
+                      console.log(`[AI Summarizer] Backing off for ${backoff}ms...`);
+                      await sleep(backoff);
+                      continue;
+                    }
+                  }
+
+                  // Handle Transient Server Errors (500, 503)
+                  if (res.status >= 500) {
+                    console.warn(`[AI Summarizer] Server error (${res.status}) on ${model.name}.`);
+                    if (attempt < maxAttempts) {
+                      await sleep(2000 * attempt);
+                      continue;
+                    } else if (mIdx < MODEL_CASCADE.length - 1) {
+                      break; // Cascade to 3.1 Flash-Lite
+                    }
+                  }
+
+                  if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+                  }
+
+                  const data = await res.json();
+                  const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                  if (rawText) {
+                    const parsed = JSON.parse(rawText);
+                    console.log(`✓ Succeeded with ${model.name} for "${name}"`);
+                    return parsed;
+                  }
+
+                } catch (err) {
+                  console.warn(`[AI Summarizer] Error on ${model.name} (attempt ${attempt}): ${err.message}`);
+                  if (attempt < maxAttempts) {
+                    await sleep(2000 * attempt);
+                  }
+                }
+              }
+            }
+
+            console.warn(`[AI Summarizer] All model tiers exhausted for "${name}". Using static baseline.`);
+            return null;
+          }
+
+          async function main() {
+            const registry = [];
+
+            // Process Plugins
+            if (fs.existsSync("plugins")) {
+              const pluginDirs = fs.readdirSync("plugins", { withFileTypes: true })
+                .filter(d => d.isDirectory() && !d.name.startsWith("."));
+
+              for (const dir of pluginDirs) {
+                const pluginPath = path.join("plugins", dir.name);
+                const manifestPath = path.join(pluginPath, "manifest.json");
+                const mainJsPath = path.join(pluginPath, "main.js");
+                const readmePath = path.join(pluginPath, "README.md");
+
+                if (fs.existsSync(manifestPath)) {
+                  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+                  const mainCode = fs.existsSync(mainJsPath) ? fs.readFileSync(mainJsPath, "utf-8") : "";
+                  const files = fs.readdirSync(pluginPath).filter(f => !f.startsWith("."));
+
+                  const caps = detectCapabilities(mainCode);
+                  const outline = extractStructuralOutline(mainCode);
+
+                  // Run 2-tier cascade with retries
+                  const aiResult = await summarizeWithCascade(manifest.name || dir.name, outline, manifest.description);
+
+                  const finalDesc = manifest.description || aiResult?.description || `Extension: ${manifest.name || dir.name}`;
+                  const features = aiResult?.features || (caps.includes("audio") ? ["audio playback", "music player"] : []);
+
+                  // Auto-generate README.md if missing
+                  if (!fs.existsSync(readmePath) && aiResult?.readmeBullets) {
+                    const generatedReadme = `# ${manifest.name || dir.name}\n\n${finalDesc}\n\n## Features\n${aiResult.readmeBullets.map(b => `- ${b}`).join("\n")}\n`;
+                    fs.writeFileSync(readmePath, generatedReadme, "utf-8");
+                    console.log(`✓ Auto-generated README.md for ${dir.name}`);
+                  }
+
+                  registry.push({
+                    id: manifest.id || dir.name,
+                    name: manifest.name || dir.name,
+                    author: manifest.author || "Julian Ventura",
+                    version: manifest.version || "1.0.0",
+                    type: "plugin",
+                    description: finalDesc,
+                    repo: "VenturaNotes/mirage-editor-extensions",
+                    branch: "main",
+                    path: `plugins/${dir.name}`,
+                    files: files,
+                    capabilities: caps,
+                    features: features
+                  });
+                }
+              }
+            }
+
+            // Process Scripts
+            if (fs.existsSync("scripts")) {
+              const scriptFiles = fs.readdirSync("scripts")
+                .filter(f => f.endsWith(".js") && !f.startsWith("."));
+
+              for (const file of scriptFiles) {
+                const filePath = path.join("scripts", file);
+                const scriptCode = fs.readFileSync(filePath, "utf-8");
+                const baseName = path.basename(file, ".js");
+
+                const caps = detectCapabilities(scriptCode);
+                const outline = extractStructuralOutline(scriptCode);
+                const aiResult = await summarizeWithCascade(baseName, outline, "");
 
                 registry.push({
-                  id: manifest.id || dir.name,
-                  name: manifest.name || dir.name,
-                  author: manifest.author || "Julian Ventura",
-                  version: manifest.version || "1.0.0",
-                  type: "plugin",
-                  description: manifest.description || "",
+                  id: baseName.toLowerCase().replace(/[^a-z0-9_-]/g, "-"),
+                  name: baseName.replace(/[-_]/g, " "),
+                  author: "Julian Ventura",
+                  version: "1.0.0",
+                  type: "script",
+                  description: aiResult?.description || `User script: ${file}`,
                   repo: "VenturaNotes/mirage-editor-extensions",
                   branch: "main",
-                  path: `plugins/${dir.name}`,
-                  files: files,
-                  capabilities: analysis.capabilities,
-                  features: analysis.features,
-                  commands: commands
+                  path: `scripts/${file}`,
+                  file: file,
+                  capabilities: caps,
+                  features: aiResult?.features || []
                 });
               }
             }
+
+            fs.writeFileSync("registry.json", JSON.stringify(registry, null, 2), "utf-8");
+            console.log(`✓ Generated registry.json with ${registry.length} entries.`);
           }
 
-          // 2. Scan scripts/
-          if (fs.existsSync("scripts")) {
-            const scriptFiles = fs.readdirSync("scripts")
-              .filter(f => f.endsWith(".js") && !f.startsWith("."));
-
-            for (const file of scriptFiles) {
-              const filePath = path.join("scripts", file);
-              const scriptCode = fs.readFileSync(filePath, "utf-8");
-              const baseName = path.basename(file, ".js");
-
-              const analysis = analyzeCode(scriptCode);
-
-              registry.push({
-                id: baseName.toLowerCase().replace(/[^a-z0-9_-]/g, "-"),
-                name: baseName.replace(/[-_]/g, " "),
-                author: "Julian Ventura",
-                version: "1.0.0",
-                type: "script",
-                description: `User script: ${file}`,
-                repo: "VenturaNotes/mirage-editor-extensions",
-                branch: "main",
-                path: `scripts/${file}`,
-                file: file,
-                capabilities: analysis.capabilities,
-                features: analysis.features,
-                commands: [baseName]
-              });
-            }
-          }
-
-          fs.writeFileSync("registry.json", JSON.stringify(registry, null, 2), "utf-8");
-          console.log(`✓ Generated registry.json with ${registry.length} enriched entries.`);
+          main();
           '
 
-      - name: Commit & Push updated registry.json
+      - name: Commit & Push updated catalog and generated READMEs
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add registry.json
-          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update registry.json with semantic footprints [skip ci]"
+          git add registry.json plugins/
+          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update registry & AI summaries with 2-tier cascade [skip ci]"
           git push
