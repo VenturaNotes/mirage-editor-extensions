@@ -15,11 +15,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build registry.json from folders
+      - name: Build registry.json with Automated Capability Detection
         run: |
           node -e '
           const fs = require("fs");
           const path = require("path");
+
+          // Automated Static Code Capability Classifier
+          function detectCapabilities(code) {
+            const caps = new Set();
+
+            const hasNetwork = /\\bfetch\\s*\\(|\\bhttps?\\.|\\bWebSocket\\s*\\(|\\bXMLHttpRequest\\b|\\bnet\\./.test(code);
+            const hasShell = /\\bchild_process\\b|\\bexec\\s*\\(|\\bspawn\\s*\\(|\\bnode-pty\\b|\\bexecSync\\b/.test(code);
+            const hasAudio = /\\bnew\\s+Audio\\b|\\bAudioContext\\b|\\bwebkitAudioContext\\b|["'\\`]audio\\//.test(code);
+            const hasClipboard = /\\bclipboard\\.(read|write)|\\bnavigator\\.clipboard\\b/.test(code);
+
+            if (hasNetwork) caps.add("network");
+            if (hasShell) caps.add("shell");
+            if (hasAudio) caps.add("audio");
+            if (hasClipboard) caps.add("clipboard");
+
+            // If neither network nor shell execution is detected, mark as vault-safe
+            if (!hasNetwork && !hasShell) {
+              caps.add("vault-only");
+            }
+
+            return Array.from(caps);
+          }
 
           const registry = [];
 
@@ -29,16 +51,22 @@ jobs:
               .filter(d => d.isDirectory() && !d.name.startsWith("."));
 
             for (const dir of pluginDirs) {
-              const manifestPath = path.join("plugins", dir.name, "manifest.json");
+              const pluginPath = path.join("plugins", dir.name);
+              const manifestPath = path.join(pluginPath, "manifest.json");
+              const mainJsPath = path.join(pluginPath, "main.js");
+
               if (fs.existsSync(manifestPath)) {
                 const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
-                const files = fs.readdirSync(path.join("plugins", dir.name))
-                  .filter(f => !f.startsWith("."));
+                const mainCode = fs.existsSync(mainJsPath) ? fs.readFileSync(mainJsPath, "utf-8") : "";
+                const files = fs.readdirSync(pluginPath).filter(f => !f.startsWith("."));
+
+                // Automatically infer capabilities from the code
+                const detectedCaps = detectCapabilities(mainCode);
 
                 registry.push({
                   id: manifest.id || dir.name,
                   name: manifest.name || dir.name,
-                  author: manifest.author || "Julian Ventura",
+                  author: manifest.author || "Mirage Community",
                   version: manifest.version || "1.0.0",
                   type: "plugin",
                   description: manifest.description || "",
@@ -46,7 +74,7 @@ jobs:
                   branch: "main",
                   path: `plugins/${dir.name}`,
                   files: files,
-                  capabilities: manifest.capabilities || ["vault-only"]
+                  capabilities: detectedCaps
                 });
               }
             }
@@ -58,11 +86,16 @@ jobs:
               .filter(f => f.endsWith(".js") && !f.startsWith("."));
 
             for (const file of scriptFiles) {
+              const filePath = path.join("scripts", file);
+              const scriptCode = fs.readFileSync(filePath, "utf-8");
               const baseName = path.basename(file, ".js");
+
+              const detectedCaps = detectCapabilities(scriptCode);
+
               registry.push({
                 id: baseName.toLowerCase().replace(/[^a-z0-9_-]/g, "-"),
                 name: baseName.replace(/[-_]/g, " "),
-                author: "Julian Ventura",
+                author: "Mirage Community",
                 version: "1.0.0",
                 type: "script",
                 description: `User script: ${file}`,
@@ -70,13 +103,13 @@ jobs:
                 branch: "main",
                 path: `scripts/${file}`,
                 file: file,
-                capabilities: ["vault-only"]
+                capabilities: detectedCaps
               });
             }
           }
 
           fs.writeFileSync("registry.json", JSON.stringify(registry, null, 2), "utf-8");
-          console.log(`✓ Generated registry.json with ${registry.length} entries.`);
+          console.log(`✓ Automated capability detection complete. Generated registry.json with ${registry.length} entries.`);
           '
 
       - name: Commit & Push updated registry.json
@@ -84,5 +117,5 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add registry.json
-          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update registry.json [skip ci]"
+          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update registry.json with classified capabilities [skip ci]"
           git push
