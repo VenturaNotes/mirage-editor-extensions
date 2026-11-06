@@ -1,0 +1,68 @@
+name: Validate Community Registry & Security Scan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Validate registry.json & Static Security Check
+        run: |
+          node -e '
+          const fs = require("fs");
+          const path = require("path");
+
+          // 1. JSON Syntax & Schema validation
+          const raw = fs.readFileSync("registry.json", "utf-8");
+          const registry = JSON.parse(raw);
+          if (!Array.isArray(registry)) throw new Error("registry.json must be a JSON array.");
+
+          const seenIds = new Set();
+          const BANNED_PATTERNS = [
+            /eval\\s*\\(/,
+            /new\\s+Function\\s*\\(/,
+            /child_process/,
+            /\\/etc\\/passwd/,
+            /rm\\s+-rf/
+          ];
+
+          for (const item of registry) {
+            if (!item.id || !item.name || !item.repo || !item.description) {
+              throw new Error(`Missing required fields in item: ${JSON.stringify(item)}`);
+            }
+            if (seenIds.has(item.id)) throw new Error(`Duplicate plugin/script ID: ${item.id}`);
+            seenIds.add(item.id);
+
+            // 2. Static Security Scan on local files (if hosted in-repo)
+            if (item.path && fs.existsSync(item.path)) {
+              const fullPath = path.resolve(item.path);
+              const files = fs.statSync(fullPath).isDirectory() 
+                ? fs.readdirSync(fullPath).map(f => path.join(fullPath, f))
+                : [fullPath];
+
+              for (const f of files) {
+                if (f.endsWith(".js")) {
+                  const code = fs.readFileSync(f, "utf-8");
+                  for (const pattern of BANNED_PATTERNS) {
+                    if (pattern.test(code)) {
+                      throw new Error(`[Security Flag] Disallowed pattern ${pattern} detected in ${f}`);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          console.log(`✓ Validated ${registry.length} community plugins and scripts successfully.`);
+          '
