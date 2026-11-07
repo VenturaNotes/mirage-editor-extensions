@@ -4,8 +4,7 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'plugins/**'
-      - 'scripts/**'
+      - 'extensions/**'
 
 jobs:
   build-registry:
@@ -20,7 +19,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Build registry.json with 2-Tier Cascade & Rich Schema
+      - name: Build registry.json with SHA-256 Hashes & AI Summaries
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_REF: ${{ github.ref }}
@@ -28,15 +27,20 @@ jobs:
           node -e '
           const fs = require("fs");
           const path = require("path");
+          const crypto = require("crypto");
 
           const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
           const IS_MAIN = process.env.GITHUB_REF === "refs/heads/main";
 
-          // 2-Tier Model Cascade: Flash-Lite 3.5 -> Flash-Lite 3.1
+          // 2-Tier Cascade: Flash-Lite 3.5 -> Flash-Lite 3.1
           const MODEL_CASCADE = [
             { id: "gemini-3.5-flash-lite", name: "Gemini 3.5 Flash-Lite" },
             { id: "gemini-3.1-flash-lite", name: "Gemini 3.1 Flash-Lite" }
           ];
+
+          function computeSha256(content) {
+            return crypto.createHash("sha256").update(content).digest("hex");
+          }
 
           function detectCapabilities(code) {
             const caps = new Set();
@@ -50,6 +54,16 @@ jobs:
             return Array.from(caps);
           }
 
+          // Security Scanner: Flag and block remote dynamic execution
+          function scanSecurity(code, filename) {
+            if (/import\s*\(\s*["\x27]https?:\/\//i.test(code)) {
+              throw new Error(`SECURITY VIOLATION in ${filename}: Dynamic remote import detected (e.g. import("https://...")). External dependencies must be bundled or vendored.`);
+            }
+            if (/eval\s*\(\s*(await\s+)?fetch\s*\(/i.test(code)) {
+              throw new Error(`SECURITY VIOLATION in ${filename}: Remote fetch-to-eval execution detected.`);
+            }
+          }
+
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
           async function summarizeWithCascade(name, author, type, fullCode, manifestDesc) {
@@ -61,8 +75,8 @@ jobs:
               return null;
             }
 
-            const prompt = `You are the catalog compiler for Mirage Editor extensions (plugins and scripts).
-Analyze the following source code for a ${type} named "${name}" by author "${author}".
+            const prompt = `You are the catalog compiler for Mirage Editor extensions.
+Analyze this source code for a ${type} named "${name}" by author "${author}".
 Manifest description (if any): "${manifestDesc || ''}"
 
 Source Code:
@@ -71,8 +85,8 @@ ${fullCode.slice(0, 24000)}
 Respond strictly with a JSON object:
 {
   "description": "Crisp 1-2 sentence overview for extension cards (max 160 chars)",
-  "readme": "# ${name}\n\nDetailed markdown documentation explaining: Overview, How It Works, Usage/Triggers, Requirements/Configuration.",
-  "searchKeywords": ["keyword1", "keyword2", "keyword3", "search-synonym-1", "search-synonym-2"],
+  "readme": "# ${name}\\n\\nDetailed markdown documentation explaining: Overview, How It Works, Usage/Triggers, Requirements/Configuration.",
+  "searchKeywords": ["keyword1", "keyword2", "keyword3"],
   "capabilities": ["vault-only", "vault-write", "ui-modal", "shell-trash", "audio", "status-bar"],
   "actions": ["discrete-action-1", "discrete-action-2"],
   "scope": "active-note",
@@ -98,18 +112,12 @@ Respond strictly with a JSON object:
                   });
 
                   if (res.status === 429) {
-                    console.warn(`[AI Summarizer] 429 Rate limit on ${model.name}.`);
-                    if (mIdx < MODEL_CASCADE.length - 1) {
-                      break;
-                    } else {
-                      const backoff = Math.min(3000 * attempt, 15000);
-                      await sleep(backoff);
-                      continue;
-                    }
+                    if (mIdx < MODEL_CASCADE.length - 1) break;
+                    await sleep(Math.min(3000 * attempt, 15000));
+                    continue;
                   }
 
                   if (res.status >= 500) {
-                    console.warn(`[AI Summarizer] Server error (${res.status}) on ${model.name}.`);
                     if (attempt < maxAttempts) {
                       await sleep(2000 * attempt);
                       continue;
@@ -118,9 +126,7 @@ Respond strictly with a JSON object:
                     }
                   }
 
-                  if (!res.ok) {
-                    throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-                  }
+                  if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
 
                   const data = await res.json();
                   const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
@@ -145,105 +151,102 @@ Respond strictly with a JSON object:
 
           async function main() {
             const registry = [];
+            const baseDir = "extensions";
 
-            // 1. Process Plugins: plugins/<author>/<plugin-id>/
-            if (fs.existsSync("plugins")) {
-              const authorDirs = fs.readdirSync("plugins", { withFileTypes: true })
+            if (fs.existsSync(baseDir)) {
+              const authorDirs = fs.readdirSync(baseDir, { withFileTypes: true })
                 .filter(d => d.isDirectory() && !d.name.startsWith("."));
 
               for (const aDir of authorDirs) {
                 const author = aDir.name.toLowerCase();
-                const aPath = path.join("plugins", aDir.name);
-                const pluginDirs = fs.readdirSync(aPath, { withFileTypes: true })
-                  .filter(d => d.isDirectory() && !d.name.startsWith("."));
+                const aPath = path.join(baseDir, aDir.name);
 
-                for (const pDir of pluginDirs) {
-                  const pluginPath = path.join(aPath, pDir.name);
-                  const manifestPath = path.join(pluginPath, "manifest.json");
-                  const mainJsPath = path.join(pluginPath, "main.js");
-                  const readmePath = path.join(pluginPath, "README.md");
+                for (const item of fs.readdirSync(aPath, { withFileTypes: true })) {
+                  if (item.name.startsWith(".")) continue;
 
-                  if (fs.existsSync(manifestPath)) {
-                    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
-                    const mainCode = fs.existsSync(mainJsPath) ? fs.readFileSync(mainJsPath, "utf-8") : "";
-                    const files = fs.readdirSync(pluginPath).filter(f => !f.startsWith("."));
+                  // 1. Folder Package Extension
+                  if (item.isDirectory()) {
+                    const pDir = path.join(aPath, item.name);
+                    const mainJsPath = path.join(pDir, "main.js");
+                    const manifestPath = path.join(pDir, "manifest.json");
 
-                    const caps = detectCapabilities(mainCode);
-                    const aiResult = await summarizeWithCascade(manifest.name || pDir.name, author, "plugin", mainCode, manifest.description);
+                    if (fs.existsSync(mainJsPath)) {
+                      const mainCode = fs.readFileSync(mainJsPath, "utf-8");
+                      scanSecurity(mainCode, `${author}/${item.name}/main.js`);
 
-                    const finalDesc = aiResult?.description || manifest.description || `Extension: ${manifest.name || pDir.name}`;
+                      let manifest = { id: item.name, name: item.name, version: "1.0.0" };
+                      if (fs.existsSync(manifestPath)) {
+                        try { manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8")); } catch (_) {}
+                      }
 
-                    if (!fs.existsSync(readmePath) && aiResult?.readme) {
-                      fs.writeFileSync(readmePath, aiResult.readme, "utf-8");
-                      console.log(`✓ Generated README.md for plugins/${author}/${pDir.name}`);
+                      const files = fs.readdirSync(pDir).filter(f => !f.startsWith("."));
+                      let combinedContent = mainCode;
+                      for (const f of files) {
+                        if (f !== "main.js") {
+                          try { combinedContent += fs.readFileSync(path.join(pDir, f), "utf-8"); } catch (_) {}
+                        }
+                      }
+                      const hash = computeSha256(combinedContent);
+
+                      const caps = detectCapabilities(mainCode);
+                      const aiResult = await summarizeWithCascade(manifest.name || item.name, author, "plugin", mainCode, manifest.description);
+
+                      registry.push({
+                        id: item.name,
+                        name: manifest.name || item.name,
+                        author: author,
+                        version: manifest.version || "1.0.0",
+                        type: "plugin",
+                        description: aiResult?.description || manifest.description || `Extension: ${manifest.name || item.name}`,
+                        readme: aiResult?.readme || `# ${manifest.name || item.name}\n\nExtension by @${author}`,
+                        repo: "VenturaNotes/mirage-editor-extensions",
+                        branch: "main",
+                        path: `extensions/${author}/${item.name}`,
+                        files: files,
+                        hash: hash,
+                        capabilities: aiResult?.capabilities || caps,
+                        actions: aiResult?.actions || [],
+                        searchKeywords: aiResult?.searchKeywords || [],
+                        scope: aiResult?.scope || "app-shell",
+                        inputs: aiResult?.inputs || "",
+                        outputs: aiResult?.outputs || ""
+                      });
                     }
+                  }
+
+                  // 2. Single-File Extension (.js)
+                  else if (item.isFile() && item.name.endsWith(".js")) {
+                    const filePath = path.join(aPath, item.name);
+                    const scriptCode = fs.readFileSync(filePath, "utf-8");
+                    scanSecurity(scriptCode, `${author}/${item.name}`);
+
+                    const baseName = path.basename(item.name, ".js");
+                    const hash = computeSha256(scriptCode);
+
+                    const caps = detectCapabilities(scriptCode);
+                    const aiResult = await summarizeWithCascade(baseName, author, "script", scriptCode, "");
 
                     registry.push({
-                      id: pDir.name,
-                      name: manifest.name || pDir.name,
+                      id: baseName.toLowerCase().replace(/[^a-z0-9_-]/g, "-"),
+                      name: baseName.replace(/[-_]/g, " "),
                       author: author,
-                      version: manifest.version || "1.0.0",
-                      type: "plugin",
-                      description: finalDesc,
+                      version: "1.0.0",
+                      type: "script",
+                      description: aiResult?.description || `Extension script: ${item.name}`,
+                      readme: aiResult?.readme || `# ${baseName}\n\nExtension script by @${author}`,
                       repo: "VenturaNotes/mirage-editor-extensions",
                       branch: "main",
-                      path: `plugins/${author}/${pDir.name}`,
-                      files: files,
+                      path: `extensions/${author}/${item.name}`,
+                      file: item.name,
+                      hash: hash,
                       capabilities: aiResult?.capabilities || caps,
                       actions: aiResult?.actions || [],
                       searchKeywords: aiResult?.searchKeywords || [],
-                      scope: aiResult?.scope || "app-shell",
+                      scope: aiResult?.scope || "active-note",
                       inputs: aiResult?.inputs || "",
                       outputs: aiResult?.outputs || ""
                     });
                   }
-                }
-              }
-            }
-
-            // 2. Process Scripts: scripts/<author>/<script-name>.js
-            if (fs.existsSync("scripts")) {
-              const authorDirs = fs.readdirSync("scripts", { withFileTypes: true })
-                .filter(d => d.isDirectory() && !d.name.startsWith("."));
-
-              for (const aDir of authorDirs) {
-                const author = aDir.name.toLowerCase();
-                const aPath = path.join("scripts", aDir.name);
-                const scriptFiles = fs.readdirSync(aPath, { withFileTypes: true })
-                  .filter(f => f.isFile() && f.name.endsWith(".js") && !f.name.startsWith("."));
-
-                for (const sFile of scriptFiles) {
-                  const filePath = path.join(aPath, sFile.name);
-                  const scriptCode = fs.readFileSync(filePath, "utf-8");
-                  const baseName = path.basename(sFile.name, ".js");
-                  const readmePath = path.join(aPath, `${baseName}.md`);
-
-                  const caps = detectCapabilities(scriptCode);
-                  const aiResult = await summarizeWithCascade(baseName, author, "script", scriptCode, "");
-
-                  if (!fs.existsSync(readmePath) && aiResult?.readme) {
-                    fs.writeFileSync(readmePath, aiResult.readme, "utf-8");
-                    console.log(`✓ Generated README for scripts/${author}/${sFile.name}`);
-                  }
-
-                  registry.push({
-                    id: baseName.toLowerCase().replace(/[^a-z0-9_-]/g, "-"),
-                    name: baseName.replace(/[-_]/g, " "),
-                    author: author,
-                    version: "1.0.0",
-                    type: "script",
-                    description: aiResult?.description || `User script: ${sFile.name}`,
-                    repo: "VenturaNotes/mirage-editor-extensions",
-                    branch: "main",
-                    path: `scripts/${author}/${sFile.name}`,
-                    file: sFile.name,
-                    capabilities: aiResult?.capabilities || caps,
-                    actions: aiResult?.actions || [],
-                    searchKeywords: aiResult?.searchKeywords || [],
-                    scope: aiResult?.scope || "active-note",
-                    inputs: aiResult?.inputs || "",
-                    outputs: aiResult?.outputs || ""
-                  });
                 }
               }
             }
@@ -255,10 +258,10 @@ Respond strictly with a JSON object:
           main();
           '
 
-      - name: Commit & Push updated catalog and generated READMEs
+      - name: Commit & Push updated catalog
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add registry.json plugins/ scripts/
-          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update registry & AI summaries with 2-tier cascade [skip ci]"
+          git add registry.json
+          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update registry with SHA-256 hashes & AI summaries [skip ci]"
           git push
