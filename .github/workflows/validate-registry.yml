@@ -66,7 +66,7 @@ jobs:
 
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-          async function summarizeWithCascade(name, author, type, fullCode, manifestDesc) {
+          async function summarizeWithCascade(name, author, fullCode, manifestDesc) {
             if (!GEMINI_API_KEY) {
               if (IS_MAIN) {
                 console.error("FATAL: GEMINI_API_KEY is not set on main branch.");
@@ -76,7 +76,7 @@ jobs:
             }
 
             const prompt = `You are the catalog compiler for Mirage Editor extensions.
-Analyze this source code for a ${type} named "${name}" by author "${author}".
+Analyze this source code for an extension named "${name}" by author "${author}".
 Manifest description (if any): "${manifestDesc || ''}"
 
 Source Code:
@@ -153,101 +153,90 @@ Respond strictly with a JSON object:
             const registry = [];
             const baseDir = "extensions";
 
-            if (fs.existsSync(baseDir)) {
-              const authorDirs = fs.readdirSync(baseDir, { withFileTypes: true })
-                .filter(d => d.isDirectory() && !d.name.startsWith("."));
+            if (!fs.existsSync(baseDir)) {
+              fs.writeFileSync("registry.json", JSON.stringify([], null, 2), "utf-8");
+              return;
+            }
 
-              for (const aDir of authorDirs) {
-                const author = aDir.name.toLowerCase();
-                const aPath = path.join(baseDir, aDir.name);
+            const authorDirs = fs.readdirSync(baseDir, { withFileTypes: true })
+              .filter(d => d.isDirectory() && !d.name.startsWith("."));
 
-                for (const item of fs.readdirSync(aPath, { withFileTypes: true })) {
-                  if (item.name.startsWith(".")) continue;
+            for (const aDir of authorDirs) {
+              const author = aDir.name.toLowerCase();
 
-                  // 1. Folder Package Extension
-                  if (item.isDirectory()) {
-                    const pDir = path.join(aPath, item.name);
-                    const mainJsPath = path.join(pDir, "main.js");
-                    const manifestPath = path.join(pDir, "manifest.json");
+              // Reserved keyword protection: "local" cannot be submitted to the registry
+              if (author === "local") {
+                throw new Error("SECURITY VIOLATION: The author namespace 'local' is reserved for personal extensions and cannot exist in the community repository.");
+              }
 
-                    if (fs.existsSync(mainJsPath)) {
-                      const mainCode = fs.readFileSync(mainJsPath, "utf-8");
-                      scanSecurity(mainCode, `${author}/${item.name}/main.js`);
+              const aPath = path.join(baseDir, aDir.name);
 
-                      let manifest = { id: item.name, name: item.name, version: "1.0.0" };
-                      if (fs.existsSync(manifestPath)) {
-                        try { manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8")); } catch (_) {}
+              for (const item of fs.readdirSync(aPath, { withFileTypes: true })) {
+                if (item.name.startsWith(".")) continue;
+
+                // Enforce that all extensions are directory packages
+                if (!item.isDirectory()) {
+                  console.warn(`[Skipping file] extensions/${author}/${item.name}: All extensions must be in their own folder containing a main.js.`);
+                  continue;
+                }
+
+                const extDir = path.join(aPath, item.name);
+                const mainJsPath = path.join(extDir, "main.js");
+                const manifestPath = path.join(extDir, "manifest.json");
+
+                if (!fs.existsSync(mainJsPath)) {
+                  console.warn(`[Skipping folder] extensions/${author}/${item.name}: Missing main.js.`);
+                  continue;
+                }
+
+                const mainCode = fs.readFileSync(mainJsPath, "utf-8");
+                scanSecurity(mainCode, `${author}/${item.name}/main.js`);
+
+                let manifest = { id: item.name, name: item.name, version: "1.0.0" };
+                if (fs.existsSync(manifestPath)) {
+                  try { manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8")); } catch (_) {}
+                }
+
+                const files = fs.readdirSync(extDir).filter(f => !f.startsWith("."));
+                let combinedContent = mainCode;
+
+                for (const f of files) {
+                  if (f !== "main.js") {
+                    const filePath = path.join(extDir, f);
+                    try {
+                      const content = fs.readFileSync(filePath, "utf-8");
+                      combinedContent += content;
+                      if (f.endsWith(".js")) {
+                        scanSecurity(content, `${author}/${item.name}/${f}`);
                       }
-
-                      const files = fs.readdirSync(pDir).filter(f => !f.startsWith("."));
-                      let combinedContent = mainCode;
-                      for (const f of files) {
-                        if (f !== "main.js") {
-                          try { combinedContent += fs.readFileSync(path.join(pDir, f), "utf-8"); } catch (_) {}
-                        }
-                      }
-                      const hash = computeSha256(combinedContent);
-
-                      const caps = detectCapabilities(mainCode);
-                      const aiResult = await summarizeWithCascade(manifest.name || item.name, author, "plugin", mainCode, manifest.description);
-
-                      registry.push({
-                        id: item.name,
-                        name: manifest.name || item.name,
-                        author: author,
-                        version: manifest.version || "1.0.0",
-                        type: "plugin",
-                        description: aiResult?.description || manifest.description || `Extension: ${manifest.name || item.name}`,
-                        readme: aiResult?.readme || `# ${manifest.name || item.name}\n\nExtension by @${author}`,
-                        repo: "VenturaNotes/mirage-editor-extensions",
-                        branch: "main",
-                        path: `extensions/${author}/${item.name}`,
-                        files: files,
-                        hash: hash,
-                        capabilities: aiResult?.capabilities || caps,
-                        actions: aiResult?.actions || [],
-                        searchKeywords: aiResult?.searchKeywords || [],
-                        scope: aiResult?.scope || "app-shell",
-                        inputs: aiResult?.inputs || "",
-                        outputs: aiResult?.outputs || ""
-                      });
-                    }
-                  }
-
-                  // 2. Single-File Extension (.js)
-                  else if (item.isFile() && item.name.endsWith(".js")) {
-                    const filePath = path.join(aPath, item.name);
-                    const scriptCode = fs.readFileSync(filePath, "utf-8");
-                    scanSecurity(scriptCode, `${author}/${item.name}`);
-
-                    const baseName = path.basename(item.name, ".js");
-                    const hash = computeSha256(scriptCode);
-
-                    const caps = detectCapabilities(scriptCode);
-                    const aiResult = await summarizeWithCascade(baseName, author, "script", scriptCode, "");
-
-                    registry.push({
-                      id: baseName.toLowerCase().replace(/[^a-z0-9_-]/g, "-"),
-                      name: baseName.replace(/[-_]/g, " "),
-                      author: author,
-                      version: "1.0.0",
-                      type: "script",
-                      description: aiResult?.description || `Extension script: ${item.name}`,
-                      readme: aiResult?.readme || `# ${baseName}\n\nExtension script by @${author}`,
-                      repo: "VenturaNotes/mirage-editor-extensions",
-                      branch: "main",
-                      path: `extensions/${author}/${item.name}`,
-                      file: item.name,
-                      hash: hash,
-                      capabilities: aiResult?.capabilities || caps,
-                      actions: aiResult?.actions || [],
-                      searchKeywords: aiResult?.searchKeywords || [],
-                      scope: aiResult?.scope || "active-note",
-                      inputs: aiResult?.inputs || "",
-                      outputs: aiResult?.outputs || ""
-                    });
+                    } catch (_) {}
                   }
                 }
+
+                const hash = computeSha256(combinedContent);
+                const caps = detectCapabilities(mainCode);
+                const aiResult = await summarizeWithCascade(manifest.name || item.name, author, combinedContent, manifest.description);
+
+                registry.push({
+                  id: item.name,
+                  name: manifest.name || item.name,
+                  author: author,
+                  version: manifest.version || "1.0.0",
+                  type: "extension",
+                  description: aiResult?.description || manifest.description || `Extension: ${manifest.name || item.name}`,
+                  readme: aiResult?.readme || `# ${manifest.name || item.name}\\n\\nExtension by @${author}`,
+                  repo: "VenturaNotes/mirage-editor-extensions",
+                  branch: "main",
+                  path: `extensions/${author}/${item.name}`,
+                  files: files,
+                  hash: hash,
+                  capabilities: aiResult?.capabilities || caps,
+                  actions: aiResult?.actions || [],
+                  searchKeywords: aiResult?.searchKeywords || [],
+                  scope: aiResult?.scope || "active-note",
+                  inputs: aiResult?.inputs || "",
+                  outputs: aiResult?.outputs || ""
+                });
               }
             }
 
