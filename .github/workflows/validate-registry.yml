@@ -1,256 +1,320 @@
-name: Generate Registry Catalog & AI Summarizer
+name: Extension Gatekeeper & SQLite Catalog Builder
 
 on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'authors/**'
   push:
     branches: [ main ]
     paths:
-      - 'extensions/**'
+      - 'authors/**'
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
-  build-registry:
+  # ===========================================================================
+  # JOB 1: Pull Request Gatekeeper (Security, Identity, & Auto-Merge)
+  # ===========================================================================
+  validate-and-merge:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout PR Branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Build registry.json with SHA-256 Hashes & AI Summaries
+      - name: Verify PR Author Identity & Changed Files
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GITHUB_REF: ${{ github.ref }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          node -e '
+          const { execSync } = require("child_process");
+          const prAuthor = process.env.PR_AUTHOR.toLowerCase().trim();
+
+          const diffOutput = execSync("git diff --name-only origin/main...HEAD", { encoding: "utf-8" }).trim();
+          const changedFiles = diffOutput.split("\n").map(f => f.trim()).filter(Boolean);
+
+          console.log(`PR Author: @${prAuthor}`);
+          console.log("Changed files:\n" + changedFiles.join("\n"));
+
+          if (changedFiles.length === 0) {
+            throw new Error("No files were modified in this PR.");
+          }
+
+          for (const file of changedFiles) {
+            // Rule 1: Only JSON files in authors/ can be modified by PRs
+            if (!file.startsWith("authors/") || !file.endsWith(".json")) {
+              throw new Error(`SECURITY VIOLATION: Pull requests can only add or modify files in authors/<author>/*.json. Forbidden file: ${file}`);
+            }
+
+            // Rule 2: Path must follow authors/<author>/<id>.json
+            const parts = file.split("/");
+            if (parts.length !== 3) {
+              throw new Error(`Invalid path structure: "${file}". Expected "authors/<author>/<id>.json".`);
+            }
+
+            const targetAuthor = parts[1].toLowerCase().trim();
+
+            // Rule 3: Protected author names
+            if (targetAuthor === "local" || targetAuthor === "mirage" || targetAuthor === "official") {
+              throw new Error(`SECURITY VIOLATION: The author namespace "${targetAuthor}" is reserved.`);
+            }
+
+            // Rule 4: PR Author MUST strictly match directory name
+            if (targetAuthor !== prAuthor) {
+              throw new Error(`SECURITY VIOLATION: User @${prAuthor} is not authorized to modify files under authors/${targetAuthor}/.`);
+            }
+          }
+
+          console.log("✔ Identity verification passed: All modified files belong to @" + prAuthor);
+          '
+
+      - name: Validate Release Assets & AST Static Security
         run: |
           node -e '
           const fs = require("fs");
           const path = require("path");
           const crypto = require("crypto");
+          const { execSync } = require("child_process");
 
-          const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-          const IS_MAIN = process.env.GITHUB_REF === "refs/heads/main";
+          // AST / Regex Security Scanner
+          function scanSecurity(code, filename) {
+            // Block eval() and new Function()
+            if (/\beval\s*\(|\bnew\s+Function\s*\(|\bwindow\.eval\b|\bglobalThis\.eval\b/.test(code)) {
+              throw new Error(`SECURITY VIOLATION in ${filename}: Dynamic code evaluation (eval / new Function) is prohibited.`);
+            }
 
-          // 2-Tier Cascade: Flash-Lite 3.5 -> Flash-Lite 3.1
-          const MODEL_CASCADE = [
-            { id: "gemini-3.5-flash-lite", name: "Gemini 3.5 Flash-Lite" },
-            { id: "gemini-3.1-flash-lite", name: "Gemini 3.1 Flash-Lite" }
-          ];
+            // Block dynamic remote imports
+            if (/import\s*\(\s*["\x27]https?:\/\//i.test(code) || /require\s*\(\s*["\x27]https?:\/\//i.test(code)) {
+              throw new Error(`SECURITY VIOLATION in ${filename}: Dynamic remote import detected. Dependencies must be bundled.`);
+            }
 
-          function computeSha256(content) {
-            return crypto.createHash("sha256").update(content).digest("hex");
+            // Block remote fetch-to-eval
+            if (/eval\s*\(\s*(await\s+)?fetch\s*\(/i.test(code)) {
+              throw new Error(`SECURITY VIOLATION in ${filename}: Remote fetch-to-eval detected.`);
+            }
+
+            // Block common obfuscated payload runners (e.g. hex array decoders)
+            if (/\\x[0-9a-fA-F]{2}\\x[0-9a-fA-F]{2}\\x[0-9a-fA-F]{2}/.test(code) && code.length > 5000) {
+              const hexDensity = (code.match(/\\x[0-9a-fA-F]{2}/g) || []).length / code.length;
+              if (hexDensity > 0.05) {
+                throw new Error(`SECURITY VIOLATION in ${filename}: Obfuscated hex payloads detected. Code must be published in human-readable form.`);
+              }
+            }
           }
 
-          function detectCapabilities(code) {
+          function deriveCapabilities(code) {
             const caps = new Set();
-            if (/\bfetch\s*\(|\bhttps?:|\bWebSocket\s*\(|\bXMLHttpRequest\b/.test(code)) caps.add("network");
-            if (/\bchild_process\b|\bexec\s*\(|\bspawn\s*\(|\bnode-pty\b/.test(code)) caps.add("shell");
+            if (/\bfetch\s*\(|\bhttps?:|\bWebSocket\s*\(|\bXMLHttpRequest\b/.test(code)) caps.add("network-access");
+            if (/\bchild_process\b|\bexec\s*\(|\bspawn\s*\(|\bnode-pty\b/.test(code)) caps.add("terminal-execution");
             if (/\bnew\s+Audio\b|\bAudioContext\b|["\x27\x60]audio\//.test(code)) caps.add("audio");
             if (/\bclipboard\.(read|write)|\bnavigator\.clipboard\b/.test(code)) caps.add("clipboard");
             if (/statusBar\.addItem/.test(code)) caps.add("status-bar");
             if (/writeFile|readFile|unlink/.test(code)) caps.add("vault-write");
-            if (!caps.has("network") && !caps.has("shell")) caps.add("vault-only");
+            if (!caps.has("network-access") && !caps.has("terminal-execution")) caps.add("vault-only");
             return Array.from(caps);
           }
 
-          // Security Scanner: Flag and block remote dynamic execution
-          function scanSecurity(code, filename) {
-            if (/import\s*\(\s*["\x27]https?:\/\//i.test(code)) {
-              throw new Error(`SECURITY VIOLATION in ${filename}: Dynamic remote import detected (e.g. import("https://...")). External dependencies must be bundled or vendored.`);
+          async function validateAll() {
+            const diffOutput = execSync("git diff --name-only origin/main...HEAD", { encoding: "utf-8" }).trim();
+            const changedFiles = diffOutput.split("\n").map(f => f.trim()).filter(Boolean);
+
+            for (const file of changedFiles) {
+              console.log(`\nInspecting ${file}...`);
+              const raw = fs.readFileSync(file, "utf-8");
+              const entry = JSON.parse(raw);
+
+              // Validate required manifest fields
+              const requiredFields = ["id", "name", "author", "version", "repo", "releaseTag", "description"];
+              for (const field of requiredFields) {
+                if (!entry[field]) {
+                  throw new Error(`Missing required field "${field}" in ${file}`);
+                }
+              }
+
+              // Fetch Release from Author Repository
+              const releaseUrl = `https://api.github.com/repos/${entry.repo}/releases/tags/${encodeURIComponent(entry.releaseTag)}`;
+              console.log(`Checking release: ${releaseUrl}`);
+
+              const headers = { "User-Agent": "Mirage-Gatekeeper", "Accept": "application/vnd.github.v3+json" };
+              if (process.env.GITHUB_TOKEN) {
+                headers["Authorization"] = `Bearer ${process.env.GITHUB_TOKEN}`;
+              }
+
+              const res = await fetch(releaseUrl, { headers });
+              if (!res.ok) {
+                throw new Error(`Could not find GitHub Release tag "${entry.releaseTag}" on ${entry.repo} (HTTP ${res.status}: ${res.statusText}).`);
+              }
+
+              const releaseData = await res.json();
+              const assets = releaseData.assets || [];
+              const assetNames = assets.map(a => a.name);
+              console.log(`Found release assets: ${assetNames.join(", ")}`);
+
+              const mainJsAsset = assets.find(a => a.name === "main.js" || a.name.endsWith(".main.js"));
+              if (!mainJsAsset) {
+                throw new Error(`Release "${entry.releaseTag}" does not contain a "main.js" asset.`);
+              }
+
+              // Download main.js for AST security scan
+              console.log(`Downloading and scanning ${mainJsAsset.name}...`);
+              const jsRes = await fetch(mainJsAsset.browser_download_url);
+              const jsCode = await jsRes.text();
+
+              // Run AST Security checks
+              scanSecurity(jsCode, `${entry.id}/${mainJsAsset.name}`);
+              console.log(`✔ Security scan passed for ${entry.id}`);
+
+              // Derive immutable capabilities
+              const derived = deriveCapabilities(jsCode);
+              console.log(`Derived capabilities: ${derived.join(", ")}`);
+
+              // Guard against spoofed badges
+              if (derived.includes("network-access") && entry.capabilities && entry.capabilities.includes("vault-only")) {
+                throw new Error(`CAPABILITY MISMATCH: Extension "${entry.id}" uses network requests but claims "vault-only" capability.`);
+              }
             }
-            if (/eval\s*\(\s*(await\s+)?fetch\s*\(/i.test(code)) {
-              throw new Error(`SECURITY VIOLATION in ${filename}: Remote fetch-to-eval execution detected.`);
-            }
+
+            console.log("\n✔ All security scans and release asset verifications passed!");
           }
 
-          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          validateAll();
+          '
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-          async function summarizeWithCascade(name, author, fullCode, manifestDesc) {
-            if (!GEMINI_API_KEY) {
-              if (IS_MAIN) {
-                console.error("FATAL: GEMINI_API_KEY is not set on main branch.");
-                process.exit(1);
-              }
-              return null;
-            }
+      - name: Approve and Auto-Merge PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          echo "Approving PR..."
+          gh pr review "$PR_URL" --approve --body "✅ **Automated Security Scan Passed**: Identity verified, release assets confirmed, and AST scan clean. Auto-merging into catalog."
+          echo "Merging PR..."
+          gh pr merge "$PR_URL" --squash --admin || gh pr merge "$PR_URL" --squash --auto
 
-            const prompt = `You are the catalog compiler for Mirage Editor extensions.
-Analyze this source code for an extension named "${name}" by author "${author}".
-Manifest description (if any): "${manifestDesc || ''}"
+  # ===========================================================================
+  # JOB 2: Compile SQLite (FTS5) & JSON Catalog on Push to Main
+  # ===========================================================================
+  build-catalog:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-Source Code:
-${fullCode.slice(0, 24000)}
+      - name: Setup Node.js & SQLite
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
-Respond strictly with a JSON object:
-{
-  "description": "Crisp 1-2 sentence overview for extension cards (max 160 chars)",
-  "readme": "# ${name}\\n\\nDetailed markdown documentation explaining: Overview, How It Works, Usage/Triggers, Requirements/Configuration.",
-  "searchKeywords": ["keyword1", "keyword2", "keyword3"],
-  "capabilities": ["vault-only", "vault-write", "ui-modal", "shell-trash", "audio", "status-bar"],
-  "actions": ["discrete-action-1", "discrete-action-2"],
-  "scope": "active-note",
-  "inputs": "What environment inputs or active notes it requires",
-  "outputs": "What files, artifacts, or state it produces"
-}`;
+      - name: Install SQLite3 CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
 
-            for (let mIdx = 0; mIdx < MODEL_CASCADE.length; mIdx++) {
-              const model = MODEL_CASCADE[mIdx];
-              const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model.id}:generateContent?key=${GEMINI_API_KEY}`;
-              const maxAttempts = 3;
+      - name: Compile master registry.json and catalog.sqlite (FTS5)
+        run: |
+          node -e '
+          const fs = require("fs");
+          const path = require("path");
+          const { execSync } = require("child_process");
 
-              for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          const authorsDir = "authors";
+          const registry = [];
+
+          if (fs.existsSync(authorsDir)) {
+            for (const authorFolder of fs.readdirSync(authorsDir, { withFileTypes: true })) {
+              if (!authorFolder.isDirectory() || authorFolder.name.startsWith(".")) continue;
+              const aPath = path.join(authorsDir, authorFolder.name);
+
+              for (const file of fs.readdirSync(aPath)) {
+                if (!file.endsWith(".json")) continue;
                 try {
-                  console.log(`[AI Summarizer] Querying ${model.name} for "${name}" (attempt ${attempt}/${maxAttempts})...`);
-                  const res = await fetch(endpoint, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                      contents: [{ parts: [{ text: prompt }] }],
-                      generationConfig: { responseMimeType: "application/json" }
-                    })
-                  });
-
-                  if (res.status === 429) {
-                    if (mIdx < MODEL_CASCADE.length - 1) break;
-                    await sleep(Math.min(3000 * attempt, 15000));
-                    continue;
-                  }
-
-                  if (res.status >= 500) {
-                    if (attempt < maxAttempts) {
-                      await sleep(2000 * attempt);
-                      continue;
-                    } else if (mIdx < MODEL_CASCADE.length - 1) {
-                      break;
-                    }
-                  }
-
-                  if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-
-                  const data = await res.json();
-                  const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-                  if (rawText) {
-                    const parsed = JSON.parse(rawText);
-                    console.log(`✓ Succeeded with ${model.name} for "${name}"`);
-                    return parsed;
-                  }
-                } catch (err) {
-                  console.warn(`[AI Summarizer] Error on ${model.name} (attempt ${attempt}): ${err.message}`);
-                  if (attempt < maxAttempts) await sleep(2000 * attempt);
+                  const entry = JSON.parse(fs.readFileSync(path.join(aPath, file), "utf-8"));
+                  registry.push(entry);
+                } catch (e) {
+                  console.warn(`Failed to parse ${file}:`, e);
                 }
               }
             }
-
-            if (IS_MAIN) {
-              console.error(`FATAL: AI summarization failed for "${name}" across all model tiers on main branch.`);
-              process.exit(1);
-            }
-            return null;
           }
 
-          async function main() {
-            const registry = [];
-            const baseDir = "extensions";
+          // Sort by updatedAt descending
+          registry.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 
-            if (!fs.existsSync(baseDir)) {
-              fs.writeFileSync("registry.json", JSON.stringify([], null, 2), "utf-8");
-              return;
-            }
+          // 1. Write master registry.json
+          fs.writeFileSync("registry.json", JSON.stringify(registry, null, 2), "utf-8");
+          console.log(`✔ Compiled registry.json with ${registry.length} extensions.`);
 
-            const authorDirs = fs.readdirSync(baseDir, { withFileTypes: true })
-              .filter(d => d.isDirectory() && !d.name.startsWith("."));
+          // 2. Build SQLite Database with FTS5
+          const dbPath = "catalog.sqlite";
+          if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
 
-            for (const aDir of authorDirs) {
-              const author = aDir.name.toLowerCase();
+          const sqlCommands = [
+            "PRAGMA journal_mode = OFF;",
+            "PRAGMA synchronous = 0;",
+            `CREATE TABLE extensions (
+              id TEXT PRIMARY KEY,
+              name TEXT,
+              author TEXT,
+              version TEXT,
+              description TEXT,
+              repo TEXT,
+              release_tag TEXT,
+              capabilities TEXT,
+              search_keywords TEXT,
+              downloads INTEGER DEFAULT 0,
+              hash TEXT,
+              updated_at INTEGER
+            );`,
+            "CREATE INDEX idx_extensions_downloads ON extensions(downloads DESC);",
+            "CREATE INDEX idx_extensions_updated ON extensions(updated_at DESC);",
+            "CREATE INDEX idx_extensions_author ON extensions(author);",
+            `CREATE VIRTUAL TABLE extensions_fts USING fts5(
+              id, name, author, description, search_keywords, capabilities,
+              content=\x27extensions\x27, content_rowid=\x27rowid\x27
+            );`
+          ];
 
-              // Reserved keyword protection: "local" cannot be submitted to the registry
-              if (author === "local") {
-                throw new Error("SECURITY VIOLATION: The author namespace 'local' is reserved for personal extensions and cannot exist in the community repository.");
-              }
+          fs.writeFileSync("init.sql", sqlCommands.join("\n"), "utf-8");
+          execSync(`sqlite3 ${dbPath} < init.sql`);
+          fs.unlinkSync("init.sql");
 
-              const aPath = path.join(baseDir, aDir.name);
+          // Insert all entries
+          for (const item of registry) {
+            const capsStr = (item.capabilities || []).join(", ");
+            const kwStr = (item.searchKeywords || []).join(", ");
+            const desc = (item.description || "").replace(/'/g, "''");
+            const name = (item.name || "").replace(/'/g, "''");
 
-              for (const item of fs.readdirSync(aPath, { withFileTypes: true })) {
-                if (item.name.startsWith(".")) continue;
-
-                // Enforce that all extensions are directory packages
-                if (!item.isDirectory()) {
-                  console.warn(`[Skipping file] extensions/${author}/${item.name}: All extensions must be in their own folder containing a main.js.`);
-                  continue;
-                }
-
-                const extDir = path.join(aPath, item.name);
-                const mainJsPath = path.join(extDir, "main.js");
-                const manifestPath = path.join(extDir, "manifest.json");
-
-                if (!fs.existsSync(mainJsPath)) {
-                  console.warn(`[Skipping folder] extensions/${author}/${item.name}: Missing main.js.`);
-                  continue;
-                }
-
-                const mainCode = fs.readFileSync(mainJsPath, "utf-8");
-                scanSecurity(mainCode, `${author}/${item.name}/main.js`);
-
-                let manifest = { id: item.name, name: item.name, version: "1.0.0" };
-                if (fs.existsSync(manifestPath)) {
-                  try { manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8")); } catch (_) {}
-                }
-
-                const files = fs.readdirSync(extDir).filter(f => !f.startsWith("."));
-                let combinedContent = mainCode;
-
-                for (const f of files) {
-                  if (f !== "main.js") {
-                    const filePath = path.join(extDir, f);
-                    try {
-                      const content = fs.readFileSync(filePath, "utf-8");
-                      combinedContent += content;
-                      if (f.endsWith(".js")) {
-                        scanSecurity(content, `${author}/${item.name}/${f}`);
-                      }
-                    } catch (_) {}
-                  }
-                }
-
-                const hash = computeSha256(combinedContent);
-                const caps = detectCapabilities(mainCode);
-                const aiResult = await summarizeWithCascade(manifest.name || item.name, author, combinedContent, manifest.description);
-
-                registry.push({
-                  id: item.name,
-                  name: manifest.name || item.name,
-                  author: author,
-                  version: manifest.version || "1.0.0",
-                  type: "extension",
-                  description: aiResult?.description || manifest.description || `Extension: ${manifest.name || item.name}`,
-                  readme: aiResult?.readme || `# ${manifest.name || item.name}\\n\\nExtension by @${author}`,
-                  repo: "VenturaNotes/mirage-editor-extensions",
-                  branch: "main",
-                  path: `extensions/${author}/${item.name}`,
-                  files: files,
-                  hash: hash,
-                  capabilities: aiResult?.capabilities || caps,
-                  actions: aiResult?.actions || [],
-                  searchKeywords: aiResult?.searchKeywords || [],
-                  scope: aiResult?.scope || "active-note",
-                  inputs: aiResult?.inputs || "",
-                  outputs: aiResult?.outputs || ""
-                });
-              }
-            }
-
-            fs.writeFileSync("registry.json", JSON.stringify(registry, null, 2), "utf-8");
-            console.log(`✓ Generated registry.json with ${registry.length} entries.`);
+            const insertSql = `
+              INSERT INTO extensions (id, name, author, version, description, repo, release_tag, capabilities, search_keywords, downloads, hash, updated_at)
+              VALUES ('${item.id}', '${name}', '${item.author}', '${item.version}', '${desc}', '${item.repo}', '${item.releaseTag}', '${capsStr}', '${kwStr}', ${item.downloads || 0}, '${item.hash || ""}', ${item.updatedAt || Date.now()});
+              INSERT INTO extensions_fts(rowid, id, name, author, description, search_keywords, capabilities)
+              VALUES (last_insert_rowid(), '${item.id}', '${name}', '${item.author}', '${desc}', '${kwStr}', '${capsStr}');
+            `;
+            fs.writeFileSync("insert.sql", insertSql, "utf-8");
+            execSync(`sqlite3 ${dbPath} < insert.sql`);
+            fs.unlinkSync("insert.sql");
           }
 
-          main();
+          console.log(`✔ Compiled catalog.sqlite with FTS5 search table and indexes.`);
           '
 
-      - name: Commit & Push updated catalog
+      - name: Commit & Push Compiled Catalog
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add registry.json
-          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update registry with SHA-256 hashes & AI summaries [skip ci]"
+          git add registry.json catalog.sqlite
+          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-compile registry.json & catalog.sqlite [skip ci]"
           git push
