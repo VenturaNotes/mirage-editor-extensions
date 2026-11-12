@@ -10,6 +10,7 @@ on:
     paths:
       - 'authors/**'
       - '.github/workflows/**'
+      - 'blocklist.txt'
   workflow_dispatch:
 
 permissions:
@@ -53,10 +54,12 @@ jobs:
           }
 
           for (const file of changedFiles) {
+            // Rule 1: Only JSON files in authors/ can be modified by PRs
             if (!file.startsWith("authors/") || !file.endsWith(".json")) {
               throw new Error(`SECURITY VIOLATION: Pull requests can only add or modify files in authors/<author>/*.json. Forbidden file: ${file}`);
             }
 
+            // Rule 2: Path must follow authors/<author>/<id>.json
             const parts = file.split("/");
             if (parts.length !== 3) {
               throw new Error(`Invalid path structure: "${file}". Expected "authors/<author>/<id>.json".`);
@@ -64,10 +67,12 @@ jobs:
 
             const targetAuthor = parts[1].toLowerCase().trim();
 
+            // Rule 3: Protected author namespaces
             if (targetAuthor === "local" || targetAuthor === "mirage" || targetAuthor === "official") {
               throw new Error(`SECURITY VIOLATION: The author namespace "${targetAuthor}" is reserved.`);
             }
 
+            // Rule 4: PR Author MUST strictly match directory name
             if (targetAuthor !== prAuthor) {
               throw new Error(`SECURITY VIOLATION: User @${prAuthor} is not authorized to modify files under authors/${targetAuthor}/.`);
             }
@@ -193,7 +198,7 @@ jobs:
           gh pr merge "$PR_URL" --squash --admin || gh pr merge "$PR_URL" --squash --auto
 
   # ===========================================================================
-  # JOB 2: Compile SQLite (FTS5) & JSON Catalog on Push to Main
+  # JOB 2: Compile SQLite (FTS5) & Blocklist Catalog on Push to Main
   # ===========================================================================
   build-catalog:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -212,7 +217,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sqlite3
 
-      - name: Compile master registry.json and catalog.sqlite (FTS5)
+      - name: Compile catalog.sqlite (FTS5 + Blocklist Table)
         run: |
           cat << 'EOF' > compile_catalog.js
           const fs = require("fs");
@@ -241,11 +246,6 @@ jobs:
 
           registry.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 
-          // 1. Write master registry.json
-          fs.writeFileSync("registry.json", JSON.stringify(registry, null, 2), "utf-8");
-          console.log(`✔ Compiled registry.json with ${registry.length} extensions.`);
-
-          // 2. Build SQLite Database with FTS5
           const dbPath = "catalog.sqlite";
           if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
 
@@ -273,9 +273,15 @@ jobs:
             `CREATE VIRTUAL TABLE extensions_fts USING fts5(
               id, name, author, description, search_keywords, capabilities,
               content='extensions', content_rowid='rowid'
+            );`,
+            `CREATE TABLE IF NOT EXISTS blocklist (
+              id TEXT PRIMARY KEY,
+              reason TEXT,
+              created_at INTEGER
             );`
           ];
 
+          // Insert all extensions
           for (const item of registry) {
             const capsStr = (item.capabilities || []).join(", ").replace(/'/g, "''");
             const kwStr = (item.searchKeywords || []).join(", ").replace(/'/g, "''");
@@ -298,20 +304,29 @@ jobs:
             `);
           }
 
+          // If a blocklist.txt exists in repo root, populate the blocklist table
+          if (fs.existsSync("blocklist.txt")) {
+            const lines = fs.readFileSync("blocklist.txt", "utf-8").split("\n").map(l => l.trim()).filter(Boolean);
+            for (const blockedId of lines) {
+              const cleanId = blockedId.replace(/'/g, "''");
+              sqlStatements.push(`INSERT OR IGNORE INTO blocklist (id, reason, created_at) VALUES ('${cleanId}', 'Revoked', ${Date.now()});`);
+            }
+          }
+
           sqlStatements.push("COMMIT;");
 
           fs.writeFileSync("build_catalog.sql", sqlStatements.join("\n"), "utf-8");
           execSync(`sqlite3 ${dbPath} < build_catalog.sql`);
           fs.unlinkSync("build_catalog.sql");
 
-          console.log(`✔ Compiled catalog.sqlite with FTS5 search table and indexes.`);
+          console.log(`✔ Compiled catalog.sqlite with ${registry.length} extensions, FTS5 index, and blocklist table.`);
           EOF
           node compile_catalog.js
           rm compile_catalog.js
 
-      - name: Commit & Push Compiled Catalog
+      - name: Commit & Push Compiled SQLite Catalog
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add registry.json catalog.sqlite
-          git diff --staged --quiet || (git commit -m "Auto-compile registry.json & catalog.sqlite [skip ci]" && git push)
+          git add catalog.sqlite
+          git diff --staged --quiet || (git commit -m "Auto-compile catalog.sqlite [skip ci]" && git push)
