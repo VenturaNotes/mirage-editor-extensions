@@ -1,1 +1,25 @@
-
+[
+  {
+    "id": "lean-player",
+    "name": "Lean Player",
+    "author": "VenturaNotes",
+    "version": "1.0.0",
+    "description": "Lightweight, zero-build local music player with queue management, global search, and status bar controls.",
+    "repo": "VenturaNotes/mirage-extensions",
+    "releaseTag": "lean-player@v1.0.0",
+    "capabilities": [
+      "action",
+      "status-bar",
+      "vault-only"
+    ],
+    "searchKeywords": [
+      "music",
+      "player",
+      "audio",
+      "mp3",
+      "queue"
+    ],
+    "hash": "27915bdaa2737759bfeadc1107f9e89b582a75c435b73e2ff5693fc3f4dc08c1",
+    "updatedAt": 1794452520145
+  }
+]
