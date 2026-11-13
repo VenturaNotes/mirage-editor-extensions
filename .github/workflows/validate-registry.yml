@@ -83,13 +83,14 @@ jobs:
           node verify_identity.js
           rm verify_identity.js
 
-      - name: Validate App Version, Release Assets & AST Static Security
+      - name: Validate App Version, SHA-256 Integrity, Release Assets & AST Static Security
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cat << 'EOF' > scan_security.js
           const fs = require("fs");
           const path = require("path");
+          const crypto = require("crypto");
           const { execSync } = require("child_process");
 
           function compareSemver(aRaw, bRaw) {
@@ -209,7 +210,7 @@ jobs:
               const raw = fs.readFileSync(file, "utf-8");
               const entry = JSON.parse(raw);
 
-              const requiredFields = ["id", "name", "author", "version", "appVersion", "repo", "releaseTag", "description"];
+              const requiredFields = ["id", "name", "author", "version", "appVersion", "repo", "releaseTag", "description", "hash"];
               for (const field of requiredFields) {
                 if (!entry[field]) {
                   throw new Error(`Missing required field "${field}" in ${file}`);
@@ -243,8 +244,20 @@ jobs:
 
               console.log(`Downloading and scanning ${mainJsAsset.name}...`);
               const jsRes = await fetch(mainJsAsset.browser_download_url);
-              const jsCode = await jsRes.text();
+              if (!jsRes.ok) {
+                throw new Error(`Failed to download ${mainJsAsset.name} (HTTP ${jsRes.status}).`);
+              }
+              const jsBuffer = Buffer.from(await jsRes.arrayBuffer());
+              const actualHash = crypto.createHash("sha256").update(jsBuffer).digest("hex").toLowerCase();
 
+              if (actualHash !== String(entry.hash).trim().toLowerCase()) {
+                throw new Error(
+                  `INTEGRITY VIOLATION in ${file}: SHA-256 of ${mainJsAsset.name} (${actualHash}) does not match entry.hash (${entry.hash}).`
+                );
+              }
+              console.log(`✔ SHA-256 integrity verified: ${actualHash}`);
+
+              const jsCode = jsBuffer.toString("utf-8");
               scanSecurity(jsCode, `${entry.id}/${mainJsAsset.name}`);
               console.log(`✔ Security scan passed for ${entry.id}`);
 
@@ -256,7 +269,7 @@ jobs:
               }
             }
 
-            console.log("\n✔ All app version checks, security scans, and release asset verifications passed!");
+            console.log("\n✔ All app version checks, SHA-256 integrity checks, security scans, and release asset verifications passed!");
           }
 
           validateAll();
@@ -270,7 +283,7 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           echo "Approving PR..."
-          gh pr review "$PR_URL" --approve --body "✅ **Automated Security Scan Passed**: Identity verified, app version confirmed, release assets validated, and AST scan clean. Auto-merging into catalog."
+          gh pr review "$PR_URL" --approve --body "✅ **Automated Security Scan Passed**: Identity verified, app version confirmed, SHA-256 integrity verified, release assets validated, and AST scan clean. Auto-merging into catalog."
           echo "Merging PR..."
           gh pr merge "$PR_URL" --squash --admin || gh pr merge "$PR_URL" --squash --auto
 
