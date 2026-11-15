@@ -193,6 +193,19 @@ jobs:
             return Array.from(caps);
           }
 
+          function validateRelativePath(rawFile) {
+            const clean = String(rawFile || "").trim().replace(/\\/g, "/").replace(/^\.\//, "");
+            if (
+              !clean ||
+              clean.startsWith("/") ||
+              clean.toLowerCase() === "data.json" ||
+              clean.split("/").some((seg) => !seg || seg === ".." || seg.startsWith("."))
+            ) {
+              throw new Error(`SECURITY VIOLATION: Unsafe file path "${rawFile}" in entry.files.`);
+            }
+            return clean;
+          }
+
           async function validateAll() {
             const diffOutput = execSync("git diff --name-only origin/main...HEAD", { encoding: "utf-8" }).trim();
             const changedFiles = diffOutput.split("\n").map(f => f.trim()).filter(Boolean);
@@ -242,26 +255,55 @@ jobs:
                 throw new Error(`Release "${entry.releaseTag}" does not contain a "main.js" asset.`);
               }
 
-              console.log(`Downloading and scanning ${mainJsAsset.name}...`);
-              const jsRes = await fetch(mainJsAsset.browser_download_url);
-              if (!jsRes.ok) {
-                throw new Error(`Failed to download ${mainJsAsset.name} (HTTP ${jsRes.status}).`);
+              const filesToCheck = Array.isArray(entry.files) && entry.files.length > 0
+                ? entry.files.map(validateRelativePath)
+                : ["main.js"];
+              if (!filesToCheck.includes("main.js")) {
+                filesToCheck.unshift("main.js");
               }
-              const jsBuffer = Buffer.from(await jsRes.arrayBuffer());
-              const actualHash = crypto.createHash("sha256").update(jsBuffer).digest("hex").toLowerCase();
 
-              if (actualHash !== String(entry.hash).trim().toLowerCase()) {
-                throw new Error(
-                  `INTEGRITY VIOLATION in ${file}: SHA-256 of ${mainJsAsset.name} (${actualHash}) does not match entry.hash (${entry.hash}).`
-                );
+              let combinedJsCode = "";
+
+              for (const relPath of filesToCheck) {
+                const expectedAssetName = relPath.includes("/") ? relPath.replace(/\//g, "__") : relPath;
+                const asset = relPath === "main.js" ? mainJsAsset : assets.find(a => a.name === expectedAssetName);
+                if (!asset) {
+                  throw new Error(`Release "${entry.releaseTag}" is missing declared asset "${expectedAssetName}" (for ${relPath}).`);
+                }
+
+                console.log(`Downloading and verifying ${relPath} (${asset.name})...`);
+                const fileRes = await fetch(asset.browser_download_url);
+                if (!fileRes.ok) {
+                  throw new Error(`Failed to download ${asset.name} (HTTP ${fileRes.status}).`);
+                }
+                const fileBuf = Buffer.from(await fileRes.arrayBuffer());
+                const fileSha = crypto.createHash("sha256").update(fileBuf).digest("hex").toLowerCase();
+
+                if (relPath === "main.js" && fileSha !== String(entry.hash).trim().toLowerCase()) {
+                  throw new Error(
+                    `INTEGRITY VIOLATION in ${file}: SHA-256 of main.js (${fileSha}) does not match entry.hash (${entry.hash}).`
+                  );
+                }
+                if (entry.fileHashes && entry.fileHashes[relPath]) {
+                  const declared = String(entry.fileHashes[relPath]).trim().toLowerCase();
+                  if (fileSha !== declared) {
+                    throw new Error(
+                      `INTEGRITY VIOLATION in ${file}: SHA-256 of ${relPath} (${fileSha}) does not match entry.fileHashes["${relPath}"] (${declared}).`
+                    );
+                  }
+                }
+                console.log(`✔ SHA-256 verified for ${relPath}: ${fileSha}`);
+
+                if (/\.(js|cjs)$/i.test(relPath)) {
+                  const jsCode = fileBuf.toString("utf-8");
+                  scanSecurity(jsCode, `${entry.id}/${relPath}`);
+                  combinedJsCode += `\n// ${relPath}\n${jsCode}`;
+                }
               }
-              console.log(`✔ SHA-256 integrity verified: ${actualHash}`);
 
-              const jsCode = jsBuffer.toString("utf-8");
-              scanSecurity(jsCode, `${entry.id}/${mainJsAsset.name}`);
-              console.log(`✔ Security scan passed for ${entry.id}`);
+              console.log(`✔ Security scan passed across all JS files for ${entry.id}`);
 
-              const derived = deriveCapabilities(jsCode);
+              const derived = deriveCapabilities(combinedJsCode);
               console.log(`Derived capabilities: ${derived.join(", ")}`);
 
               if (derived.includes("network-access") && entry.capabilities && entry.capabilities.includes("vault-only")) {
@@ -269,7 +311,7 @@ jobs:
               }
             }
 
-            console.log("\n✔ All app version checks, SHA-256 integrity checks, security scans, and release asset verifications passed!");
+            console.log("\n✔ All app version checks, multi-file SHA-256 integrity checks, security scans, and release asset verifications passed!");
           }
 
           validateAll();
@@ -283,7 +325,7 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           echo "Approving PR..."
-          gh pr review "$PR_URL" --approve --body "✅ **Automated Security Scan Passed**: Identity verified, app version confirmed, SHA-256 integrity verified, release assets validated, and AST scan clean. Auto-merging into catalog."
+          gh pr review "$PR_URL" --approve --body "✅ **Automated Security Scan Passed**: Identity verified, app version confirmed, multi-file SHA-256 integrity verified, release assets validated, and AST scan clean. Auto-merging into catalog."
           echo "Merging PR..."
           gh pr merge "$PR_URL" --squash --admin || gh pr merge "$PR_URL" --squash --auto
 
@@ -344,9 +386,9 @@ jobs:
             "PRAGMA synchronous = 0;",
             "BEGIN TRANSACTION;",
             `CREATE TABLE extensions (
-              id TEXT PRIMARY KEY,
+              id TEXT NOT NULL,
               name TEXT,
-              author TEXT,
+              author TEXT NOT NULL,
               version TEXT,
               description TEXT,
               repo TEXT,
@@ -355,7 +397,10 @@ jobs:
               search_keywords TEXT,
               downloads INTEGER DEFAULT 0,
               hash TEXT,
-              updated_at INTEGER
+              files TEXT,
+              file_hashes TEXT,
+              updated_at INTEGER,
+              PRIMARY KEY (author, id)
             );`,
             "CREATE INDEX idx_extensions_downloads ON extensions(downloads DESC);",
             "CREATE INDEX idx_extensions_updated ON extensions(updated_at DESC);",
@@ -371,34 +416,36 @@ jobs:
             );`
           ];
 
-          // Insert all extensions
+          const esc = (s) => String(s || "").replace(/'/g, "''");
+
           for (const item of registry) {
-            const capsStr = (item.capabilities || []).join(", ").replace(/'/g, "''");
-            const kwStr = (item.searchKeywords || []).join(", ").replace(/'/g, "''");
-            const desc = (item.description || "").replace(/'/g, "''");
-            const name = (item.name || "").replace(/'/g, "''");
-            const id = (item.id || "").replace(/'/g, "''");
-            const author = (item.author || "").replace(/'/g, "''");
-            const repo = (item.repo || "").replace(/'/g, "''");
-            const releaseTag = (item.releaseTag || "").replace(/'/g, "''");
-            const version = (item.version || "").replace(/'/g, "''");
-            const hash = (item.hash || "").replace(/'/g, "''");
+            const capsStr = esc((item.capabilities || []).join(", "));
+            const kwStr = esc((item.searchKeywords || []).join(", "));
+            const desc = esc(item.description);
+            const name = esc(item.name);
+            const id = esc(item.id);
+            const author = esc(item.author);
+            const repo = esc(item.repo);
+            const releaseTag = esc(item.releaseTag);
+            const version = esc(item.version);
+            const hash = esc(item.hash);
+            const filesJson = esc(JSON.stringify(item.files || []));
+            const fileHashesJson = esc(JSON.stringify(item.fileHashes || {}));
             const updatedAt = item.updatedAt || Date.now();
             const downloads = item.downloads || 0;
 
             sqlStatements.push(`
-              INSERT INTO extensions (id, name, author, version, description, repo, release_tag, capabilities, search_keywords, downloads, hash, updated_at)
-              VALUES ('${id}', '${name}', '${author}', '${version}', '${desc}', '${repo}', '${releaseTag}', '${capsStr}', '${kwStr}', ${downloads}, '${hash}', ${updatedAt});
+              INSERT INTO extensions (id, name, author, version, description, repo, release_tag, capabilities, search_keywords, downloads, hash, files, file_hashes, updated_at)
+              VALUES ('${id}', '${name}', '${author}', '${version}', '${desc}', '${repo}', '${releaseTag}', '${capsStr}', '${kwStr}', ${downloads}, '${hash}', '${filesJson}', '${fileHashesJson}', ${updatedAt});
               INSERT INTO extensions_fts(rowid, id, name, author, description, search_keywords, capabilities)
               VALUES (last_insert_rowid(), '${id}', '${name}', '${author}', '${desc}', '${kwStr}', '${capsStr}');
             `);
           }
 
-          // If a blocklist.txt exists in repo root, populate the blocklist table
           if (fs.existsSync("blocklist.txt")) {
             const lines = fs.readFileSync("blocklist.txt", "utf-8").split("\n").map(l => l.trim()).filter(Boolean);
             for (const blockedId of lines) {
-              const cleanId = blockedId.replace(/'/g, "''");
+              const cleanId = esc(blockedId);
               sqlStatements.push(`INSERT OR IGNORE INTO blocklist (id, reason, created_at) VALUES ('${cleanId}', 'Revoked', ${Date.now()});`);
             }
           }
