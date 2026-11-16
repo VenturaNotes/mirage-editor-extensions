@@ -1,0 +1,33 @@
+{
+  "id": "findorphanedimages",
+  "name": "FindOrphanedImages",
+  "author": "VenturaNotes",
+  "version": "1.0.0",
+  "appVersion": "0.1.0-alpha.28",
+  "description": "Find and clean up unreferenced image files in your Mirage Editor vault with an interactive management modal.",
+  "repo": "VenturaNotes/mirage-extensions",
+  "releaseTag": "findorphanedimages@v1.0.0",
+  "capabilities": [
+    "action",
+    "vault-only"
+  ],
+  "searchKeywords": [
+    "images",
+    "orphaned",
+    "cleanup",
+    "vault",
+    "storage"
+  ],
+  "files": [
+    "manifest.json",
+    "main.js",
+    "styles.css"
+  ],
+  "hash": "0490b41a377953b6bd0e505f772a64dff575b74d9e0295e55f5ec345ad54099e",
+  "fileHashes": {
+    "manifest.json": "776a9c956264e6bc0d5d59acdd528d85731178630413d25e20ca695ca18e4b27",
+    "main.js": "0490b41a377953b6bd0e505f772a64dff575b74d9e0295e55f5ec345ad54099e",
+    "styles.css": "153a107e28addff7c99f7ab0e58675a4de09c8fe41fb25bb7464b304be224b04"
+  },
+  "updatedAt": 1794806972292
+}
