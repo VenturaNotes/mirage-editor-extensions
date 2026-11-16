@@ -12,13 +12,99 @@ on:
       - 'authors/**'
       - '.github/workflows/**'
       - 'blocklist.txt'
+  schedule:
+    - cron: '17 * * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 jobs:
+  # ===========================================================================
+  # JOB 0: Hourly Sweep for Transient / Rate-Limited Open PRs
+  # ===========================================================================
+  sweep-backlog:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Retry Failed Rate-Limited PR Runs
+        env:
+          REPO_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO_FULL_NAME: ${{ github.repository }}
+        run: |
+          cat << 'EOF' > sweep.js
+          async function main() {
+            const repo = process.env.REPO_FULL_NAME;
+            const headers = {
+              "User-Agent": "Mirage-Gatekeeper-Sweep",
+              "Accept": "application/vnd.github.v3+json",
+              "Authorization": `Bearer ${process.env.REPO_TOKEN}`
+            };
+
+            const prsRes = await fetch(
+              `https://api.github.com/repos/${repo}/pulls?state=open&sort=created&direction=asc&per_page=100`,
+              { headers }
+            );
+            if (!prsRes.ok) {
+              throw new Error(`Failed to list open PRs: HTTP ${prsRes.status}`);
+            }
+
+            const prs = await prsRes.json();
+            console.log(`Found ${prs.length} open PR(s).`);
+
+            let retried = 0;
+            const MAX_RETRIES_PER_SWEEP = 30;
+
+            for (const pr of prs) {
+              if (retried >= MAX_RETRIES_PER_SWEEP) break;
+              const headSha = pr.head?.sha;
+              if (!headSha) continue;
+
+              const runsRes = await fetch(
+                `https://api.github.com/repos/${repo}/actions/runs?head_sha=${encodeURIComponent(headSha)}&event=pull_request_target&per_page=5`,
+                { headers }
+              );
+              if (!runsRes.ok) continue;
+
+              const runsData = await runsRes.json();
+              const latestRun = (runsData.workflow_runs || []).find(
+                (r) => r.name === "Extension Gatekeeper & SQLite Catalog Builder"
+              );
+
+              if (latestRun && latestRun.status === "completed" && latestRun.conclusion === "failure") {
+                console.log(`Retrying failed run ${latestRun.id} for PR #${pr.number}...`);
+                const rerunRes = await fetch(
+                  `https://api.github.com/repos/${repo}/actions/runs/${latestRun.id}/rerun-failed-jobs`,
+                  { method: "POST", headers }
+                );
+                if (rerunRes.ok) {
+                  retried++;
+                } else {
+                  console.warn(`Could not rerun ${latestRun.id}: HTTP ${rerunRes.status}`);
+                }
+              }
+            }
+
+            console.log(`✔ Sweep finished. Retried ${retried} run(s).`);
+          }
+
+          main().catch((err) => {
+            console.error(err);
+            process.exit(1);
+          });
+          EOF
+          node sweep.js
+          rm sweep.js
+
   # ===========================================================================
   # JOB 1: Pull Request Gatekeeper (1-PR Limit, Identity, Integrity, & Merge)
   # ===========================================================================
@@ -57,6 +143,8 @@ jobs:
           cat << 'EOF' > validate_pr.js
           const path = require("path");
           const crypto = require("crypto");
+
+          class PermanentRejectionError extends Error {}
 
           function compareSemver(aRaw, bRaw) {
             const parse = (raw) => {
@@ -127,21 +215,21 @@ jobs:
 
           function scanSecurity(code, filename) {
             if (/\beval\s*\(|\bnew\s+Function\s*\(|\bwindow\.eval\b|\bglobalThis\.eval\b/.test(code)) {
-              throw new Error(`SECURITY VIOLATION in ${filename}: Dynamic code evaluation (eval / new Function) is prohibited.`);
+              throw new PermanentRejectionError(`SECURITY VIOLATION in ${filename}: Dynamic code evaluation (eval / new Function) is prohibited.`);
             }
 
             if (/import\s*\(\s*["']https?:\/\//i.test(code) || /require\s*\(\s*["']https?:\/\//i.test(code)) {
-              throw new Error(`SECURITY VIOLATION in ${filename}: Dynamic remote import detected. Dependencies must be bundled.`);
+              throw new PermanentRejectionError(`SECURITY VIOLATION in ${filename}: Dynamic remote import detected. Dependencies must be bundled.`);
             }
 
             if (/eval\s*\(\s*(await\s+)?fetch\s*\(/i.test(code)) {
-              throw new Error(`SECURITY VIOLATION in ${filename}: Remote fetch-to-eval detected.`);
+              throw new PermanentRejectionError(`SECURITY VIOLATION in ${filename}: Remote fetch-to-eval detected.`);
             }
 
             if (/\\x[0-9a-fA-F]{2}\\x[0-9a-fA-F]{2}\\x[0-9a-fA-F]{2}/.test(code) && code.length > 5000) {
               const hexDensity = (code.match(/\\x[0-9a-fA-F]{2}/g) || []).length / code.length;
               if (hexDensity > 0.05) {
-                throw new Error(`SECURITY VIOLATION in ${filename}: Obfuscated hex payloads detected. Code must be published in human-readable form.`);
+                throw new PermanentRejectionError(`SECURITY VIOLATION in ${filename}: Obfuscated hex payloads detected. Code must be published in human-readable form.`);
               }
             }
           }
@@ -166,9 +254,26 @@ jobs:
               clean.toLowerCase() === "data.json" ||
               clean.split("/").some((seg) => !seg || seg === ".." || seg.startsWith("."))
             ) {
-              throw new Error(`SECURITY VIOLATION: Unsafe file path "${rawFile}" in entry.files.`);
+              throw new PermanentRejectionError(`SECURITY VIOLATION: Unsafe file path "${rawFile}" in entry.files.`);
             }
             return clean;
+          }
+
+          async function closeRejectedPr(repoFullName, prNumber, repoHeaders, reason) {
+            try {
+              await fetch(`https://api.github.com/repos/${repoFullName}/issues/${prNumber}/comments`, {
+                method: "POST",
+                headers: { ...repoHeaders, "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  body: `❌ **Automated Submission Rejected**\n\n${reason}\n\nThis PR has been automatically closed so you can fix the issue and re-submit.`
+                })
+              });
+              await fetch(`https://api.github.com/repos/${repoFullName}/pulls/${prNumber}`, {
+                method: "PATCH",
+                headers: { ...repoHeaders, "Content-Type": "application/json" },
+                body: JSON.stringify({ state: "closed" })
+              });
+            } catch (_) {}
           }
 
           async function main() {
@@ -188,12 +293,15 @@ jobs:
               "Authorization": `Bearer ${process.env.CROSS_REPO_TOKEN}`
             };
 
-            // 1. Enforce 1 active PR at a time per author (reject & close newer duplicates)
-            const openPrsRes = await fetch(
-              `https://api.github.com/repos/${repoFullName}/pulls?state=open&per_page=100`,
-              { headers: repoHeaders }
-            );
-            if (openPrsRes.ok) {
+            try {
+              // 1. Enforce 1 active PR at a time per author
+              const openPrsRes = await fetch(
+                `https://api.github.com/repos/${repoFullName}/pulls?state=open&per_page=100`,
+                { headers: repoHeaders }
+              );
+              if (!openPrsRes.ok) {
+                throw new Error(`Transient error listing open PRs: HTTP ${openPrsRes.status}`);
+              }
               const openPrs = await openPrsRes.json();
               const olderOpen = openPrs.filter(
                 (p) =>
@@ -203,180 +311,185 @@ jobs:
               );
               if (olderOpen.length > 0) {
                 const existing = olderOpen[0];
-                const msg = `⚠️ **One Submission at a Time**: @${prAuthor} already has an open pull request (#${existing.number}). Please wait for #${existing.number} to merge, or close it before submitting another extension.`;
-                try {
-                  await fetch(`https://api.github.com/repos/${repoFullName}/issues/${prNumber}/comments`, {
-                    method: "POST",
-                    headers: { ...repoHeaders, "Content-Type": "application/json" },
-                    body: JSON.stringify({ body: msg })
-                  });
-                  await fetch(`https://api.github.com/repos/${repoFullName}/pulls/${prNumber}`, {
-                    method: "PATCH",
-                    headers: { ...repoHeaders, "Content-Type": "application/json" },
-                    body: JSON.stringify({ state: "closed" })
-                  });
-                } catch (_) {}
-                throw new Error(msg);
-              }
-            }
-
-            // 2. Fetch changed files and verify author identity
-            const filesRes = await fetch(`https://api.github.com/repos/${repoFullName}/pulls/${prNumber}/files?per_page=100`, { headers: repoHeaders });
-            if (!filesRes.ok) {
-              throw new Error(`Failed to fetch PR files (HTTP ${filesRes.status}: ${filesRes.statusText}).`);
-            }
-            const filesData = await filesRes.json();
-
-            console.log(`PR Author: @${prAuthor}`);
-            if (!Array.isArray(filesData) || filesData.length === 0) {
-              throw new Error("No files were modified in this PR.");
-            }
-
-            for (const f of filesData) {
-              const file = (f.filename || "").trim();
-              if (f.status === "removed" || f.status === "renamed") {
-                throw new Error(`SECURITY VIOLATION: Removing or renaming files via auto-merge is not permitted (${file}).`);
-              }
-              if (!file.startsWith("authors/") || !file.endsWith(".json")) {
-                throw new Error(`SECURITY VIOLATION: Pull requests can only add or modify files in authors/<author>/*.json. Forbidden file: ${file}`);
-              }
-              const parts = file.split("/");
-              if (parts.length !== 3) {
-                throw new Error(`Invalid path structure: "${file}". Expected "authors/<author>/<id>.json".`);
-              }
-              const targetAuthor = parts[1].toLowerCase().trim();
-              if (targetAuthor === "local" || targetAuthor === "mirage" || targetAuthor === "official") {
-                throw new Error(`SECURITY VIOLATION: The author namespace "${targetAuthor}" is reserved.`);
-              }
-              if (targetAuthor !== prAuthor) {
-                throw new Error(`SECURITY VIOLATION: User @${prAuthor} is not authorized to modify files under authors/${targetAuthor}/.`);
-              }
-            }
-            console.log(`✔ Identity verified for @${prAuthor}`);
-
-            // 3. Check Mirage Editor version using APP_TOKEN (5,000/hr)
-            const latestMirageVersion = await getLatestMirageVersion(repoHeaders);
-            console.log(`Latest Mirage Editor release: v${latestMirageVersion}`);
-
-            // 4. Verify each changed extension entry + release assets + AST security
-            for (const f of filesData) {
-              const file = f.filename;
-              console.log(`\nInspecting ${file}...`);
-
-              let rawText = "";
-              if (f.raw_url) {
-                const rawRes = await fetch(f.raw_url);
-                if (rawRes.ok) rawText = await rawRes.text();
-              }
-              if (!rawText) {
-                const apiRes = await fetch(
-                  `https://api.github.com/repos/${repoFullName}/contents/${file.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(headSha)}`,
-                  { headers: { ...repoHeaders, "Accept": "application/vnd.github.raw+json" } }
-                );
-                if (!apiRes.ok) {
-                  throw new Error(`Failed to read ${file} from PR head ${headSha} (HTTP ${apiRes.status}).`);
-                }
-                rawText = await apiRes.text();
-              }
-
-              const entry = JSON.parse(rawText);
-
-              const requiredFields = ["id", "name", "author", "version", "appVersion", "repo", "releaseTag", "description", "hash"];
-              for (const field of requiredFields) {
-                if (!entry[field]) {
-                  throw new Error(`Missing required field "${field}" in ${file}`);
-                }
-              }
-
-              const expectedId = path.basename(file, ".json");
-              if (String(entry.author).toLowerCase().trim() !== prAuthor) {
-                throw new Error(`SECURITY VIOLATION in ${file}: entry.author ("${entry.author}") must match PR author "@${prAuthor}".`);
-              }
-              if (String(entry.id).trim() !== expectedId) {
-                throw new Error(`VALIDATION ERROR in ${file}: entry.id ("${entry.id}") must match filename "${expectedId}".`);
-              }
-              if (!String(entry.repo).toLowerCase().startsWith(`${prAuthor}/`)) {
-                throw new Error(`SECURITY VIOLATION in ${file}: entry.repo ("${entry.repo}") must be owned by "@${prAuthor}".`);
-              }
-
-              if (compareSemver(entry.appVersion, latestMirageVersion) < 0) {
-                throw new Error(
-                  `VERSION VIOLATION in ${file}: Submitted from Mirage Editor v${entry.appVersion}, but latest release is v${latestMirageVersion}. Please update Mirage Editor before publishing.`
+                throw new PermanentRejectionError(
+                  `One Submission at a Time: @${prAuthor} already has an open pull request (#${existing.number}). Please wait for #${existing.number} to merge, or close it before submitting another extension.`
                 );
               }
-              console.log(`✔ App version verified: v${entry.appVersion} >= v${latestMirageVersion}`);
 
-              const releaseUrl = `https://api.github.com/repos/${entry.repo}/releases/tags/${encodeURIComponent(entry.releaseTag)}`;
-              const res = await fetch(releaseUrl, { headers: crossRepoHeaders });
-              if (!res.ok) {
-                throw new Error(`Could not find GitHub Release tag "${entry.releaseTag}" on ${entry.repo} (HTTP ${res.status}: ${res.statusText}).`);
+              // 2. Fetch changed files & verify identity
+              const filesRes = await fetch(`https://api.github.com/repos/${repoFullName}/pulls/${prNumber}/files?per_page=100`, { headers: repoHeaders });
+              if (!filesRes.ok) {
+                throw new Error(`Failed to fetch PR files (HTTP ${filesRes.status}: ${filesRes.statusText}).`);
+              }
+              const filesData = await filesRes.json();
+
+              console.log(`PR Author: @${prAuthor}`);
+              if (!Array.isArray(filesData) || filesData.length === 0) {
+                throw new PermanentRejectionError("No files were modified in this PR.");
               }
 
-              const releaseData = await res.json();
-              const assets = releaseData.assets || [];
-              const mainJsAsset = assets.find(a => a.name === "main.js" || a.name.endsWith(".main.js"));
-              if (!mainJsAsset) {
-                throw new Error(`Release "${entry.releaseTag}" does not contain a "main.js" asset.`);
-              }
-
-              const filesToCheck = Array.isArray(entry.files) && entry.files.length > 0
-                ? entry.files.map(validateRelativePath)
-                : ["main.js"];
-              if (!filesToCheck.includes("main.js")) {
-                filesToCheck.unshift("main.js");
-              }
-
-              let combinedJsCode = "";
-
-              for (const relPath of filesToCheck) {
-                const expectedAssetName = relPath.includes("/") ? relPath.replace(/\//g, "__") : relPath;
-                const asset = relPath === "main.js" ? mainJsAsset : assets.find(a => a.name === expectedAssetName);
-                if (!asset) {
-                  throw new Error(`Release "${entry.releaseTag}" is missing declared asset "${expectedAssetName}" (for ${relPath}).`);
+              for (const f of filesData) {
+                const file = (f.filename || "").trim();
+                if (f.status === "removed" || f.status === "renamed") {
+                  throw new PermanentRejectionError(`SECURITY VIOLATION: Removing or renaming files via auto-merge is not permitted (${file}).`);
                 }
-
-                const fileRes = await fetch(asset.browser_download_url);
-                if (!fileRes.ok) {
-                  throw new Error(`Failed to download ${asset.name} (HTTP ${fileRes.status}).`);
+                if (!file.startsWith("authors/") || !file.endsWith(".json")) {
+                  throw new PermanentRejectionError(`SECURITY VIOLATION: Pull requests can only add or modify files in authors/<author>/*.json. Forbidden file: ${file}`);
                 }
-                const fileBuf = Buffer.from(await fileRes.arrayBuffer());
-                const fileSha = crypto.createHash("sha256").update(fileBuf).digest("hex").toLowerCase();
+                const parts = file.split("/");
+                if (parts.length !== 3) {
+                  throw new PermanentRejectionError(`Invalid path structure: "${file}". Expected "authors/<author>/<id>.json".`);
+                }
+                const targetAuthor = parts[1].toLowerCase().trim();
+                if (targetAuthor === "local" || targetAuthor === "mirage" || targetAuthor === "official") {
+                  throw new PermanentRejectionError(`SECURITY VIOLATION: The author namespace "${targetAuthor}" is reserved.`);
+                }
+                if (targetAuthor !== prAuthor) {
+                  throw new PermanentRejectionError(`SECURITY VIOLATION: User @${prAuthor} is not authorized to modify files under authors/${targetAuthor}/.`);
+                }
+              }
+              console.log(`✔ Identity verified for @${prAuthor}`);
 
-                if (relPath === "main.js" && fileSha !== String(entry.hash).trim().toLowerCase()) {
-                  throw new Error(
-                    `INTEGRITY VIOLATION in ${file}: SHA-256 of main.js (${fileSha}) does not match entry.hash (${entry.hash}).`
+              // 3. Check Mirage Editor version using APP_TOKEN
+              const latestMirageVersion = await getLatestMirageVersion(repoHeaders);
+              console.log(`Latest Mirage Editor release: v${latestMirageVersion}`);
+
+              // 4. Verify entry, release assets, SHA-256 & AST security
+              for (const f of filesData) {
+                const file = f.filename;
+                console.log(`\nInspecting ${file}...`);
+
+                let rawText = "";
+                if (f.raw_url) {
+                  const rawRes = await fetch(f.raw_url);
+                  if (rawRes.ok) rawText = await rawRes.text();
+                }
+                if (!rawText) {
+                  const apiRes = await fetch(
+                    `https://api.github.com/repos/${repoFullName}/contents/${file.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(headSha)}`,
+                    { headers: { ...repoHeaders, "Accept": "application/vnd.github.raw+json" } }
                   );
+                  if (!apiRes.ok) {
+                    throw new Error(`Failed to read ${file} from PR head ${headSha} (HTTP ${apiRes.status}).`);
+                  }
+                  rawText = await apiRes.text();
                 }
-                if (entry.fileHashes && entry.fileHashes[relPath]) {
-                  const declared = String(entry.fileHashes[relPath]).trim().toLowerCase();
-                  if (fileSha !== declared) {
-                    throw new Error(
-                      `INTEGRITY VIOLATION in ${file}: SHA-256 of ${relPath} (${fileSha}) does not match entry.fileHashes["${relPath}"] (${declared}).`
-                    );
+
+                let entry;
+                try {
+                  entry = JSON.parse(rawText);
+                } catch (e) {
+                  throw new PermanentRejectionError(`Invalid JSON syntax in ${file}: ${e.message}`);
+                }
+
+                const requiredFields = ["id", "name", "author", "version", "appVersion", "repo", "releaseTag", "description", "hash"];
+                for (const field of requiredFields) {
+                  if (!entry[field]) {
+                    throw new PermanentRejectionError(`Missing required field "${field}" in ${file}`);
                   }
                 }
-                console.log(`✔ SHA-256 verified for ${relPath}`);
 
-                if (/\.(js|cjs)$/i.test(relPath)) {
-                  const jsCode = fileBuf.toString("utf-8");
-                  scanSecurity(jsCode, `${entry.id}/${relPath}`);
-                  combinedJsCode += `\n// ${relPath}\n${jsCode}`;
+                const expectedId = path.basename(file, ".json");
+                if (String(entry.author).toLowerCase().trim() !== prAuthor) {
+                  throw new PermanentRejectionError(`SECURITY VIOLATION in ${file}: entry.author ("${entry.author}") must match PR author "@${prAuthor}".`);
+                }
+                if (String(entry.id).trim() !== expectedId) {
+                  throw new PermanentRejectionError(`VALIDATION ERROR in ${file}: entry.id ("${entry.id}") must match filename "${expectedId}".`);
+                }
+                if (!String(entry.repo).toLowerCase().startsWith(`${prAuthor}/`)) {
+                  throw new PermanentRejectionError(`SECURITY VIOLATION in ${file}: entry.repo ("${entry.repo}") must be owned by "@${prAuthor}".`);
+                }
+
+                if (compareSemver(entry.appVersion, latestMirageVersion) < 0) {
+                  throw new PermanentRejectionError(
+                    `VERSION VIOLATION in ${file}: Submitted from Mirage Editor v${entry.appVersion}, but latest release is v${latestMirageVersion}. Please update Mirage Editor before publishing.`
+                  );
+                }
+                console.log(`✔ App version verified: v${entry.appVersion} >= v${latestMirageVersion}`);
+
+                const releaseUrl = `https://api.github.com/repos/${entry.repo}/releases/tags/${encodeURIComponent(entry.releaseTag)}`;
+                const res = await fetch(releaseUrl, { headers: crossRepoHeaders });
+                if (res.status === 404) {
+                  throw new PermanentRejectionError(`Could not find GitHub Release tag "${entry.releaseTag}" on ${entry.repo} (HTTP 404).`);
+                }
+                if (!res.ok) {
+                  throw new Error(`Transient error fetching release tag "${entry.releaseTag}" on ${entry.repo} (HTTP ${res.status}: ${res.statusText}).`);
+                }
+
+                const releaseData = await res.json();
+                const assets = releaseData.assets || [];
+                const mainJsAsset = assets.find(a => a.name === "main.js" || a.name.endsWith(".main.js"));
+                if (!mainJsAsset) {
+                  throw new PermanentRejectionError(`Release "${entry.releaseTag}" does not contain a "main.js" asset.`);
+                }
+
+                const filesToCheck = Array.isArray(entry.files) && entry.files.length > 0
+                  ? entry.files.map(validateRelativePath)
+                  : ["main.js"];
+                if (!filesToCheck.includes("main.js")) {
+                  filesToCheck.unshift("main.js");
+                }
+
+                let combinedJsCode = "";
+
+                for (const relPath of filesToCheck) {
+                  const expectedAssetName = relPath.includes("/") ? relPath.replace(/\//g, "__") : relPath;
+                  const asset = relPath === "main.js" ? mainJsAsset : assets.find(a => a.name === expectedAssetName);
+                  if (!asset) {
+                    throw new PermanentRejectionError(`Release "${entry.releaseTag}" is missing declared asset "${expectedAssetName}" (for ${relPath}).`);
+                  }
+
+                  const fileRes = await fetch(asset.browser_download_url);
+                  if (fileRes.status === 404) {
+                    throw new PermanentRejectionError(`Release asset "${asset.name}" returned HTTP 404.`);
+                  }
+                  if (!fileRes.ok) {
+                    throw new Error(`Transient error downloading ${asset.name} (HTTP ${fileRes.status}).`);
+                  }
+                  const fileBuf = Buffer.from(await fileRes.arrayBuffer());
+                  const fileSha = crypto.createHash("sha256").update(fileBuf).digest("hex").toLowerCase();
+
+                  if (relPath === "main.js" && fileSha !== String(entry.hash).trim().toLowerCase()) {
+                    throw new PermanentRejectionError(
+                      `INTEGRITY VIOLATION in ${file}: SHA-256 of main.js (${fileSha}) does not match entry.hash (${entry.hash}).`
+                    );
+                  }
+                  if (entry.fileHashes && entry.fileHashes[relPath]) {
+                    const declared = String(entry.fileHashes[relPath]).trim().toLowerCase();
+                    if (fileSha !== declared) {
+                      throw new PermanentRejectionError(
+                        `INTEGRITY VIOLATION in ${file}: SHA-256 of ${relPath} (${fileSha}) does not match entry.fileHashes["${relPath}"] (${declared}).`
+                      );
+                    }
+                  }
+                  console.log(`✔ SHA-256 verified for ${relPath}`);
+
+                  if (/\.(js|cjs)$/i.test(relPath)) {
+                    const jsCode = fileBuf.toString("utf-8");
+                    scanSecurity(jsCode, `${entry.id}/${relPath}`);
+                    combinedJsCode += `\n// ${relPath}\n${jsCode}`;
+                  }
+                }
+
+                const derived = deriveCapabilities(combinedJsCode);
+                if (derived.includes("network-access") && entry.capabilities && entry.capabilities.includes("vault-only")) {
+                  throw new PermanentRejectionError(`CAPABILITY MISMATCH: Extension "${entry.id}" uses network requests but claims "vault-only" capability.`);
                 }
               }
 
-              const derived = deriveCapabilities(combinedJsCode);
-              if (derived.includes("network-access") && entry.capabilities && entry.capabilities.includes("vault-only")) {
-                throw new Error(`CAPABILITY MISMATCH: Extension "${entry.id}" uses network requests but claims "vault-only" capability.`);
+              console.log("\n✔ All checks passed!");
+            } catch (err) {
+              if (err instanceof PermanentRejectionError) {
+                console.error("PERMANENT REJECTION:", err.message);
+                await closeRejectedPr(repoFullName, prNumber, repoHeaders, err.message);
+              } else {
+                console.error("TRANSIENT / RATE-LIMIT ERROR (leaving PR open for sweep):", err);
               }
+              process.exit(1);
             }
-
-            console.log("\n✔ All checks passed!");
           }
 
-          main().catch((err) => {
-            console.error(err);
-            process.exit(1);
-          });
+          main();
           EOF
           node validate_pr.js
           rm validate_pr.js
@@ -390,7 +503,7 @@ jobs:
           gh pr merge "$PR_URL" --squash || gh pr merge "$PR_URL" --squash --auto
 
   # ===========================================================================
-  # JOB 2: Compile SQLite (FTS5) via Prepared Statements & Upload to `catalog-latest`
+  # JOB 2: Compile SQLite + Gzipped Snapshot + Meta + Rolling Deduplicated Delta
   # ===========================================================================
   build-catalog:
     needs: [validate-and-merge]
@@ -422,135 +535,293 @@ jobs:
         with:
           node-version: 24
 
-      - name: Compile catalog.sqlite (Prepared Statements + FTS5 + Blocklist)
+      - name: Compile catalog.sqlite.gz, catalog-meta.json & catalog-delta.jsonl.gz
+        env:
+          REPO_FULL_NAME: ${{ github.repository }}
         run: |
           cat << 'EOF' > compile_catalog.js
           const fs = require("fs");
           const path = require("path");
+          const zlib = require("zlib");
           const { DatabaseSync } = require("node:sqlite");
 
-          const authorsDir = "authors";
-          const registry = [];
+          const MAX_DELTA_ENTRIES = 5000;
 
-          if (fs.existsSync(authorsDir)) {
-            for (const authorFolder of fs.readdirSync(authorsDir, { withFileTypes: true })) {
-              if (!authorFolder.isDirectory() || authorFolder.name.startsWith(".")) continue;
-              const aPath = path.join(authorsDir, authorFolder.name);
+          function rowFingerprint(item) {
+            return JSON.stringify([
+              item.name || "",
+              item.version || "",
+              item.description || "",
+              item.repo || "",
+              item.release_tag || item.releaseTag || "",
+              item.capabilities || "",
+              item.search_keywords || "",
+              Number(item.downloads || 0),
+              item.hash || "",
+              item.files || "[]",
+              item.file_hashes || "{}",
+              Number(item.updated_at || item.updatedAt || 0)
+            ]);
+          }
 
-              for (const file of fs.readdirSync(aPath)) {
-                if (!file.endsWith(".json")) continue;
-                try {
-                  const entry = JSON.parse(fs.readFileSync(path.join(aPath, file), "utf-8"));
-                  registry.push(entry);
-                } catch (e) {
-                  console.warn(`Failed to parse ${file}:`, e);
+          async function downloadPrevAsset(repo, filename) {
+            try {
+              const res = await fetch(`https://github.com/${repo}/releases/download/catalog-latest/${filename}`);
+              if (res.ok) return Buffer.from(await res.arrayBuffer());
+            } catch (_) {}
+            return null;
+          }
+
+          async function main() {
+            const repo = process.env.REPO_FULL_NAME;
+
+            // 1. Load previous release artifacts (if any) to track monotonic seq & deltas
+            let prevLatestSeq = 0;
+            let prevDeltaStartSeq = 1;
+            const prevFingerprints = new Map();
+            const deltaMap = new Map();
+
+            const prevMetaBuf = await downloadPrevAsset(repo, "catalog-meta.json");
+            if (prevMetaBuf) {
+              try {
+                const pm = JSON.parse(prevMetaBuf.toString("utf-8"));
+                prevLatestSeq = Number(pm.latestSeq || 0);
+                prevDeltaStartSeq = Number(pm.deltaStartSeq || 1);
+              } catch (_) {}
+            }
+
+            const prevDeltaBuf = await downloadPrevAsset(repo, "catalog-delta.jsonl.gz");
+            if (prevDeltaBuf) {
+              try {
+                const lines = zlib.gunzipSync(prevDeltaBuf).toString("utf-8").split("\n").filter(Boolean);
+                for (const line of lines) {
+                  const obj = JSON.parse(line);
+                  if (obj && obj.author && obj.id) {
+                    deltaMap.set(`${obj.author.toLowerCase()}/${obj.id}`, obj);
+                  }
+                }
+              } catch (_) {}
+            }
+
+            let prevSqliteBuf = await downloadPrevAsset(repo, "catalog.sqlite.gz");
+            if (prevSqliteBuf) {
+              prevSqliteBuf = zlib.gunzipSync(prevSqliteBuf);
+            } else {
+              prevSqliteBuf = await downloadPrevAsset(repo, "catalog.sqlite");
+            }
+
+            if (prevSqliteBuf) {
+              fs.writeFileSync("prev_catalog.sqlite", prevSqliteBuf);
+              try {
+                const prevDb = new DatabaseSync("prev_catalog.sqlite", { readOnly: true });
+                const prevRows = prevDb.prepare("SELECT * FROM extensions").all();
+                for (const r of prevRows) {
+                  const key = `${String(r.author).toLowerCase()}/${r.id}`;
+                  prevFingerprints.set(key, { fp: rowFingerprint(r), author: r.author, id: r.id });
+                }
+                prevDb.close();
+              } catch (_) {}
+              try { fs.unlinkSync("prev_catalog.sqlite"); } catch (_) {}
+            }
+
+            // 2. Read all current authors/<author>/<id>.json entries
+            const authorsDir = "authors";
+            const registry = [];
+            const currentKeys = new Set();
+
+            if (fs.existsSync(authorsDir)) {
+              for (const authorFolder of fs.readdirSync(authorsDir, { withFileTypes: true })) {
+                if (!authorFolder.isDirectory() || authorFolder.name.startsWith(".")) continue;
+                const aPath = path.join(authorsDir, authorFolder.name);
+
+                for (const file of fs.readdirSync(aPath)) {
+                  if (!file.endsWith(".json")) continue;
+                  try {
+                    const entry = JSON.parse(fs.readFileSync(path.join(aPath, file), "utf-8"));
+                    registry.push(entry);
+                  } catch (e) {
+                    console.warn(`Failed to parse ${file}:`, e);
+                  }
                 }
               }
             }
-          }
 
-          registry.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+            registry.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 
-          const dbPath = "catalog.sqlite";
-          if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
-
-          const db = new DatabaseSync(dbPath);
-          db.exec(`
-            PRAGMA journal_mode = OFF;
-            PRAGMA synchronous = 0;
-            CREATE TABLE extensions (
-              id TEXT NOT NULL,
-              name TEXT,
-              author TEXT NOT NULL,
-              version TEXT,
-              description TEXT,
-              repo TEXT,
-              release_tag TEXT,
-              capabilities TEXT,
-              search_keywords TEXT,
-              downloads INTEGER DEFAULT 0,
-              hash TEXT,
-              files TEXT,
-              file_hashes TEXT,
-              updated_at INTEGER,
-              PRIMARY KEY (author, id)
-            );
-            CREATE INDEX idx_extensions_downloads ON extensions(downloads DESC);
-            CREATE INDEX idx_extensions_updated ON extensions(updated_at DESC);
-            CREATE INDEX idx_extensions_author ON extensions(author);
-            CREATE VIRTUAL TABLE extensions_fts USING fts5(
-              id, name, author, description, search_keywords, capabilities,
-              content='extensions', content_rowid='rowid'
-            );
-            CREATE TABLE IF NOT EXISTS blocklist (
-              id TEXT PRIMARY KEY,
-              reason TEXT,
-              created_at INTEGER
-            );
-          `);
-
-          const insertExt = db.prepare(`
-            INSERT INTO extensions (id, name, author, version, description, repo, release_tag, capabilities, search_keywords, downloads, hash, files, file_hashes, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `);
-          const insertFts = db.prepare(`
-            INSERT INTO extensions_fts(rowid, id, name, author, description, search_keywords, capabilities)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-          `);
-          const insertBlock = db.prepare(`
-            INSERT OR IGNORE INTO blocklist (id, reason, created_at) VALUES (?, 'Revoked', ?)
-          `);
-
-          db.exec("BEGIN TRANSACTION;");
-          try {
-            for (const item of registry) {
-              const capsStr = (item.capabilities || []).join(", ");
-              const kwStr = (item.searchKeywords || []).join(", ");
-              const desc = String(item.description || "");
-              const name = String(item.name || "");
-              const id = String(item.id || "");
-              const author = String(item.author || "");
-              const repo = String(item.repo || "");
-              const releaseTag = String(item.releaseTag || "");
-              const version = String(item.version || "");
-              const hash = String(item.hash || "");
-              const filesJson = JSON.stringify(item.files || []);
-              const fileHashesJson = JSON.stringify(item.fileHashes || {});
-              const updatedAt = Number(item.updatedAt || Date.now());
-              const downloads = Number(item.downloads || 0);
-
-              const res = insertExt.run(
-                id, name, author, version, desc, repo, releaseTag,
-                capsStr, kwStr, downloads, hash, filesJson, fileHashesJson, updatedAt
-              );
-              insertFts.run(res.lastInsertRowid, id, name, author, desc, kwStr, capsStr);
+            const blocklist = [];
+            if (fs.existsSync("blocklist.txt")) {
+              const lines = fs.readFileSync("blocklist.txt", "utf-8").split("\n").map(l => l.trim()).filter(Boolean);
+              blocklist.push(...lines);
             }
 
-            if (fs.existsSync("blocklist.txt")) {
+            // 3. Build catalog.sqlite using prepared statements + compute seq deltas
+            const dbPath = "catalog.sqlite";
+            if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+
+            const db = new DatabaseSync(dbPath);
+            db.exec(`
+              PRAGMA journal_mode = OFF;
+              PRAGMA synchronous = 0;
+              CREATE TABLE extensions (
+                id TEXT NOT NULL,
+                name TEXT,
+                author TEXT NOT NULL,
+                version TEXT,
+                description TEXT,
+                repo TEXT,
+                release_tag TEXT,
+                capabilities TEXT,
+                search_keywords TEXT,
+                downloads INTEGER DEFAULT 0,
+                hash TEXT,
+                files TEXT,
+                file_hashes TEXT,
+                updated_at INTEGER,
+                PRIMARY KEY (author, id)
+              );
+              CREATE INDEX idx_extensions_downloads ON extensions(downloads DESC);
+              CREATE INDEX idx_extensions_updated ON extensions(updated_at DESC);
+              CREATE INDEX idx_extensions_author ON extensions(author);
+              CREATE VIRTUAL TABLE extensions_fts USING fts5(
+                id, name, author, description, search_keywords, capabilities,
+                content='extensions', content_rowid='rowid'
+              );
+              CREATE TABLE IF NOT EXISTS blocklist (
+                id TEXT PRIMARY KEY,
+                reason TEXT,
+                created_at INTEGER
+              );
+            `);
+
+            const insertExt = db.prepare(`
+              INSERT INTO extensions (id, name, author, version, description, repo, release_tag, capabilities, search_keywords, downloads, hash, files, file_hashes, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `);
+            const insertFts = db.prepare(`
+              INSERT INTO extensions_fts(rowid, id, name, author, description, search_keywords, capabilities)
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+            `);
+            const insertBlock = db.prepare(`
+              INSERT OR IGNORE INTO blocklist (id, reason, created_at) VALUES (?, 'Revoked', ?)
+            `);
+
+            let nextSeq = prevLatestSeq;
+
+            db.exec("BEGIN TRANSACTION;");
+            try {
+              for (const item of registry) {
+                const capsStr = (item.capabilities || []).join(", ");
+                const kwStr = (item.searchKeywords || []).join(", ");
+                const desc = String(item.description || "");
+                const name = String(item.name || "");
+                const id = String(item.id || "");
+                const author = String(item.author || "");
+                const repoField = String(item.repo || "");
+                const releaseTag = String(item.releaseTag || "");
+                const version = String(item.version || "");
+                const hash = String(item.hash || "");
+                const filesJson = JSON.stringify(item.files || []);
+                const fileHashesJson = JSON.stringify(item.fileHashes || {});
+                const updatedAt = Number(item.updatedAt || Date.now());
+                const downloads = Number(item.downloads || 0);
+
+                const res = insertExt.run(
+                  id, name, author, version, desc, repoField, releaseTag,
+                  capsStr, kwStr, downloads, hash, filesJson, fileHashesJson, updatedAt
+                );
+                insertFts.run(res.lastInsertRowid, id, name, author, desc, kwStr, capsStr);
+
+                const mapKey = `${author.toLowerCase()}/${id}`;
+                currentKeys.add(mapKey);
+                const curFp = rowFingerprint({
+                  name, version, description: desc, repo: repoField,
+                  release_tag: releaseTag, capabilities: capsStr, search_keywords: kwStr,
+                  downloads, hash, files: filesJson, file_hashes: fileHashesJson, updated_at: updatedAt
+                });
+
+                const prevInfo = prevFingerprints.get(mapKey);
+                if (!prevInfo || prevInfo.fp !== curFp) {
+                  nextSeq++;
+                  deltaMap.set(mapKey, {
+                    seq: nextSeq,
+                    op: "upsert",
+                    id, name, author, version, description: desc, repo: repoField,
+                    release_tag: releaseTag, capabilities: capsStr, search_keywords: kwStr,
+                    downloads, hash, files: filesJson, file_hashes: fileHashesJson, updated_at: updatedAt
+                  });
+                }
+              }
+
+              // Track removals in delta
+              for (const [oldKey, info] of prevFingerprints.entries()) {
+                if (!currentKeys.has(oldKey)) {
+                  nextSeq++;
+                  deltaMap.set(oldKey, {
+                    seq: nextSeq,
+                    op: "delete",
+                    author: info.author,
+                    id: info.id
+                  });
+                }
+              }
+
               const now = Date.now();
-              const lines = fs.readFileSync("blocklist.txt", "utf-8").split("\n").map(l => l.trim()).filter(Boolean);
-              for (const blockedId of lines) {
+              for (const blockedId of blocklist) {
                 insertBlock.run(blockedId, now);
               }
+              db.exec("COMMIT;");
+            } catch (err) {
+              db.exec("ROLLBACK;");
+              throw err;
+            } finally {
+              db.close();
             }
-            db.exec("COMMIT;");
-          } catch (err) {
-            db.exec("ROLLBACK;");
-            throw err;
-          } finally {
-            db.close();
+
+            // 4. Compress catalog.sqlite -> catalog.sqlite.gz
+            const sqliteBytes = fs.readFileSync(dbPath);
+            const gzSqlite = zlib.gzipSync(sqliteBytes, { level: 9 });
+            fs.writeFileSync("catalog.sqlite.gz", gzSqlite);
+
+            // 5. Sort, cap, and compress catalog-delta.jsonl.gz
+            let deltaList = Array.from(deltaMap.values()).sort((a, b) => a.seq - b.seq);
+            let deltaStartSeq = prevDeltaStartSeq || 1;
+            if (deltaList.length > MAX_DELTA_ENTRIES) {
+              const dropCount = deltaList.length - MAX_DELTA_ENTRIES;
+              const maxDroppedSeq = deltaList[dropCount - 1].seq;
+              deltaList = deltaList.slice(dropCount);
+              deltaStartSeq = Math.max(deltaStartSeq, maxDroppedSeq + 1);
+            }
+            if (nextSeq === 0) deltaStartSeq = 1;
+
+            const deltaText = deltaList.map((d) => JSON.stringify(d)).join("\n") + (deltaList.length ? "\n" : "");
+            fs.writeFileSync("catalog-delta.jsonl.gz", zlib.gzipSync(Buffer.from(deltaText, "utf-8"), { level: 9 }));
+
+            // 6. Write tiny catalog-meta.json
+            const metaObj = {
+              latestSeq: nextSeq,
+              deltaStartSeq,
+              totalCount: registry.length,
+              blocklist,
+              updatedAt: Date.now()
+            };
+            fs.writeFileSync("catalog-meta.json", JSON.stringify(metaObj), "utf-8");
+
+            console.log(`✔ Built catalog.sqlite.gz (${(gzSqlite.length / 1024).toFixed(1)} KB), delta (${deltaList.length} entries), latestSeq=${nextSeq}, deltaStartSeq=${deltaStartSeq}.`);
           }
 
-          console.log(`✔ Compiled catalog.sqlite with ${registry.length} extensions using prepared statements.`);
+          main().catch((err) => {
+            console.error(err);
+            process.exit(1);
+          });
           EOF
           node compile_catalog.js
           rm compile_catalog.js
 
-      - name: Publish catalog.sqlite to catalog-latest Release
+      - name: Publish Catalog Artifacts to catalog-latest Release
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          gh release upload catalog-latest catalog.sqlite --clobber || \
-            gh release create catalog-latest catalog.sqlite \
+          gh release upload catalog-latest catalog.sqlite.gz catalog-meta.json catalog-delta.jsonl.gz --clobber || \
+            gh release create catalog-latest catalog.sqlite.gz catalog-meta.json catalog-delta.jsonl.gz \
               --title "Extension Catalog (Latest)" \
-              --notes "Auto-compiled SQLite (FTS5) extension catalog for Mirage Editor."
+              --notes "Auto-compiled SQLite (FTS5) extension catalog, metadata, and incremental delta stream for Mirage Editor."
