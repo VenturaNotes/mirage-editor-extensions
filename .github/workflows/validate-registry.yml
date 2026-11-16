@@ -124,10 +124,10 @@ jobs:
             mirage-editor-extensions
 
       - name: Checkout Trusted Base Branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24
 
@@ -526,12 +526,12 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
       - name: Checkout Main Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: main
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24
 
