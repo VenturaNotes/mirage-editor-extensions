@@ -20,12 +20,20 @@ permissions:
 
 jobs:
   # ===========================================================================
-  # JOB 1: Pull Request Gatekeeper (Security, Identity, & Auto-Merge)
+  # JOB 1: Pull Request Gatekeeper (Identity, Integrity, Security, & Merge)
   # ===========================================================================
   validate-and-merge:
     if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     steps:
+      # Optional: Uncomment after creating your GitHub App to boost rate limit to 5,000 req/hr
+      # - name: Generate GitHub App Token
+      #   id: app-token
+      #   uses: actions/create-github-app-token@v2
+      #   with:
+      #     app-id: ${{ secrets.APP_ID }}
+      #     private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - name: Checkout Trusted Base Branch
         uses: actions/checkout@v4
 
@@ -34,84 +42,17 @@ jobs:
         with:
           node-version: 20
 
-      - name: Verify PR Author Identity & Changed Files
+      - name: Verify Identity, App Version, Integrity & AST Security
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO_FULL_NAME: ${{ github.repository }}
-        run: |
-          cat << 'EOF' > verify_identity.js
-          async function main() {
-            const prAuthor = (process.env.PR_AUTHOR || "").toLowerCase().trim();
-            const prNumber = process.env.PR_NUMBER;
-            const repo = process.env.REPO_FULL_NAME;
-
-            const headers = {
-              "User-Agent": "Mirage-Gatekeeper",
-              "Accept": "application/vnd.github.v3+json",
-              "Authorization": `Bearer ${process.env.GITHUB_TOKEN}`
-            };
-
-            const res = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}/files?per_page=100`, { headers });
-            if (!res.ok) {
-              throw new Error(`Failed to fetch PR files (HTTP ${res.status}: ${res.statusText}).`);
-            }
-
-            const filesData = await res.json();
-            console.log(`PR Author: @${prAuthor}`);
-            console.log("Changed files:\n" + filesData.map(f => `${f.status}: ${f.filename}`).join("\n"));
-
-            if (!Array.isArray(filesData) || filesData.length === 0) {
-              throw new Error("No files were modified in this PR.");
-            }
-
-            for (const f of filesData) {
-              const file = (f.filename || "").trim();
-
-              if (f.status === "removed" || f.status === "renamed") {
-                throw new Error(`SECURITY VIOLATION: Removing or renaming files via auto-merge is not permitted (${file}).`);
-              }
-
-              if (!file.startsWith("authors/") || !file.endsWith(".json")) {
-                throw new Error(`SECURITY VIOLATION: Pull requests can only add or modify files in authors/<author>/*.json. Forbidden file: ${file}`);
-              }
-
-              const parts = file.split("/");
-              if (parts.length !== 3) {
-                throw new Error(`Invalid path structure: "${file}". Expected "authors/<author>/<id>.json".`);
-              }
-
-              const targetAuthor = parts[1].toLowerCase().trim();
-              if (targetAuthor === "local" || targetAuthor === "mirage" || targetAuthor === "official") {
-                throw new Error(`SECURITY VIOLATION: The author namespace "${targetAuthor}" is reserved.`);
-              }
-
-              if (targetAuthor !== prAuthor) {
-                throw new Error(`SECURITY VIOLATION: User @${prAuthor} is not authorized to modify files under authors/${targetAuthor}/.`);
-              }
-            }
-
-            console.log("✔ Identity verification passed: All modified files belong to @" + prAuthor);
-          }
-
-          main().catch((err) => {
-            console.error(err);
-            process.exit(1);
-          });
-          EOF
-          node verify_identity.js
-          rm verify_identity.js
-
-      - name: Validate App Version, SHA-256 Integrity, Release Assets & AST Static Security
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Swap to: ${{ steps.app-token.outputs.token }} if using GitHub App
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CROSS_REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPO_FULL_NAME: ${{ github.repository }}
         run: |
-          cat << 'EOF' > scan_security.js
+          cat << 'EOF' > validate_pr.js
           const path = require("path");
           const crypto = require("crypto");
 
@@ -228,44 +169,81 @@ jobs:
             return clean;
           }
 
-          async function validateAll() {
+          async function main() {
             const prAuthor = (process.env.PR_AUTHOR || "").toLowerCase().trim();
             const prNumber = process.env.PR_NUMBER;
             const headSha = process.env.PR_HEAD_SHA;
             const repoFullName = process.env.REPO_FULL_NAME;
 
-            const headers = {
+            const repoHeaders = {
               "User-Agent": "Mirage-Gatekeeper",
               "Accept": "application/vnd.github.v3+json",
-              "Authorization": `Bearer ${process.env.GITHUB_TOKEN}`
+              "Authorization": `Bearer ${process.env.REPO_TOKEN}`
+            };
+            const crossRepoHeaders = {
+              "User-Agent": "Mirage-Gatekeeper",
+              "Accept": "application/vnd.github.v3+json",
+              "Authorization": `Bearer ${process.env.CROSS_REPO_TOKEN}`
             };
 
-            const filesRes = await fetch(`https://api.github.com/repos/${repoFullName}/pulls/${prNumber}/files?per_page=100`, { headers });
+            const filesRes = await fetch(`https://api.github.com/repos/${repoFullName}/pulls/${prNumber}/files?per_page=100`, { headers: repoHeaders });
             if (!filesRes.ok) {
               throw new Error(`Failed to fetch PR files (HTTP ${filesRes.status}: ${filesRes.statusText}).`);
             }
-            const changedFiles = (await filesRes.json()).map(f => f.filename);
+            const filesData = await filesRes.json();
 
-            const latestMirageVersion = await getLatestMirageVersion(headers);
+            console.log(`PR Author: @${prAuthor}`);
+            if (!Array.isArray(filesData) || filesData.length === 0) {
+              throw new Error("No files were modified in this PR.");
+            }
+
+            for (const f of filesData) {
+              const file = (f.filename || "").trim();
+              if (f.status === "removed" || f.status === "renamed") {
+                throw new Error(`SECURITY VIOLATION: Removing or renaming files via auto-merge is not permitted (${file}).`);
+              }
+              if (!file.startsWith("authors/") || !file.endsWith(".json")) {
+                throw new Error(`SECURITY VIOLATION: Pull requests can only add or modify files in authors/<author>/*.json. Forbidden file: ${file}`);
+              }
+              const parts = file.split("/");
+              if (parts.length !== 3) {
+                throw new Error(`Invalid path structure: "${file}". Expected "authors/<author>/<id>.json".`);
+              }
+              const targetAuthor = parts[1].toLowerCase().trim();
+              if (targetAuthor === "local" || targetAuthor === "mirage" || targetAuthor === "official") {
+                throw new Error(`SECURITY VIOLATION: The author namespace "${targetAuthor}" is reserved.`);
+              }
+              if (targetAuthor !== prAuthor) {
+                throw new Error(`SECURITY VIOLATION: User @${prAuthor} is not authorized to modify files under authors/${targetAuthor}/.`);
+              }
+            }
+            console.log(`✔ Identity verified for @${prAuthor}`);
+
+            const latestMirageVersion = await getLatestMirageVersion(crossRepoHeaders);
             console.log(`Latest Mirage Editor release: v${latestMirageVersion}`);
 
-            for (const file of changedFiles) {
+            for (const f of filesData) {
+              const file = f.filename;
               console.log(`\nInspecting ${file}...`);
-              const rawFileRes = await fetch(
-                `https://api.github.com/repos/${repoFullName}/contents/${file.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(headSha)}`,
-                {
-                  headers: {
-                    ...headers,
-                    "Accept": "application/vnd.github.raw+json"
-                  }
+
+              // Read changed JSON via CDN raw_url (0 REST API quota), fallback to API only if needed
+              let rawText = "";
+              if (f.raw_url) {
+                const rawRes = await fetch(f.raw_url);
+                if (rawRes.ok) rawText = await rawRes.text();
+              }
+              if (!rawText) {
+                const apiRes = await fetch(
+                  `https://api.github.com/repos/${repoFullName}/contents/${file.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(headSha)}`,
+                  { headers: { ...repoHeaders, "Accept": "application/vnd.github.raw+json" } }
+                );
+                if (!apiRes.ok) {
+                  throw new Error(`Failed to read ${file} from PR head ${headSha} (HTTP ${apiRes.status}).`);
                 }
-              );
-              if (!rawFileRes.ok) {
-                throw new Error(`Failed to read ${file} from PR head ${headSha} (HTTP ${rawFileRes.status}).`);
+                rawText = await apiRes.text();
               }
 
-              const raw = await rawFileRes.text();
-              const entry = JSON.parse(raw);
+              const entry = JSON.parse(rawText);
 
               const requiredFields = ["id", "name", "author", "version", "appVersion", "repo", "releaseTag", "description", "hash"];
               for (const field of requiredFields) {
@@ -293,18 +271,13 @@ jobs:
               console.log(`✔ App version verified: v${entry.appVersion} >= v${latestMirageVersion}`);
 
               const releaseUrl = `https://api.github.com/repos/${entry.repo}/releases/tags/${encodeURIComponent(entry.releaseTag)}`;
-              console.log(`Checking release: ${releaseUrl}`);
-
-              const res = await fetch(releaseUrl, { headers });
+              const res = await fetch(releaseUrl, { headers: crossRepoHeaders });
               if (!res.ok) {
                 throw new Error(`Could not find GitHub Release tag "${entry.releaseTag}" on ${entry.repo} (HTTP ${res.status}: ${res.statusText}).`);
               }
 
               const releaseData = await res.json();
               const assets = releaseData.assets || [];
-              const assetNames = assets.map(a => a.name);
-              console.log(`Found release assets: ${assetNames.join(", ")}`);
-
               const mainJsAsset = assets.find(a => a.name === "main.js" || a.name.endsWith(".main.js"));
               if (!mainJsAsset) {
                 throw new Error(`Release "${entry.releaseTag}" does not contain a "main.js" asset.`);
@@ -326,7 +299,6 @@ jobs:
                   throw new Error(`Release "${entry.releaseTag}" is missing declared asset "${expectedAssetName}" (for ${relPath}).`);
                 }
 
-                console.log(`Downloading and verifying ${relPath} (${asset.name})...`);
                 const fileRes = await fetch(asset.browser_download_url);
                 if (!fileRes.ok) {
                   throw new Error(`Failed to download ${asset.name} (HTTP ${fileRes.status}).`);
@@ -347,7 +319,7 @@ jobs:
                     );
                   }
                 }
-                console.log(`✔ SHA-256 verified for ${relPath}: ${fileSha}`);
+                console.log(`✔ SHA-256 verified for ${relPath}`);
 
                 if (/\.(js|cjs)$/i.test(relPath)) {
                   const jsCode = fileBuf.toString("utf-8");
@@ -356,35 +328,30 @@ jobs:
                 }
               }
 
-              console.log(`✔ Security scan passed across all JS files for ${entry.id}`);
-
               const derived = deriveCapabilities(combinedJsCode);
-              console.log(`Derived capabilities: ${derived.join(", ")}`);
-
               if (derived.includes("network-access") && entry.capabilities && entry.capabilities.includes("vault-only")) {
                 throw new Error(`CAPABILITY MISMATCH: Extension "${entry.id}" uses network requests but claims "vault-only" capability.`);
               }
             }
 
-            console.log("\n✔ All app version checks, multi-file SHA-256 integrity checks, security scans, and release asset verifications passed!");
+            console.log("\n✔ All checks passed!");
           }
 
-          validateAll().catch((err) => {
+          main().catch((err) => {
             console.error(err);
             process.exit(1);
           });
           EOF
-          node scan_security.js
-          rm scan_security.js
+          node validate_pr.js
+          rm validate_pr.js
 
       - name: Approve and Auto-Merge PR
         env:
+          # Swap to: ${{ steps.app-token.outputs.token }} if using GitHub App
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
-          echo "Approving PR..."
           gh pr review "$PR_URL" --approve --body "✅ **Automated Security Scan Passed**: Identity verified, app version confirmed, multi-file SHA-256 integrity verified, release assets validated, and AST scan clean. Auto-merging into catalog."
-          echo "Merging PR..."
           gh pr merge "$PR_URL" --squash || gh pr merge "$PR_URL" --squash --auto
 
   # ===========================================================================
@@ -403,6 +370,14 @@ jobs:
       cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
+      # Optional: Uncomment after creating your GitHub App
+      # - name: Generate GitHub App Token
+      #   id: app-token
+      #   uses: actions/create-github-app-token@v2
+      #   with:
+      #     app-id: ${{ secrets.APP_ID }}
+      #     private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - name: Checkout Main Repository
         uses: actions/checkout@v4
         with:
@@ -532,6 +507,7 @@ jobs:
 
       - name: Publish catalog.sqlite to catalog-latest Release
         env:
+          # Swap to: ${{ steps.app-token.outputs.token }} if using GitHub App
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if gh release view catalog-latest >/dev/null 2>&1; then
