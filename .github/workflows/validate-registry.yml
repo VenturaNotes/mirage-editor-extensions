@@ -1,7 +1,8 @@
 name: Extension Gatekeeper & SQLite Catalog Builder
 
 on:
-  pull_request:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
     branches: [ main ]
     paths:
       - 'authors/**'
@@ -22,13 +23,12 @@ jobs:
   # JOB 1: Pull Request Gatekeeper (Security, Identity, & Auto-Merge)
   # ===========================================================================
   validate-and-merge:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout PR Branch
+      # Security: checkout trusted base branch (main), never untrusted fork code
+      - name: Checkout Trusted Base Branch
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -37,48 +37,74 @@ jobs:
 
       - name: Verify PR Author Identity & Changed Files
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_FULL_NAME: ${{ github.repository }}
         run: |
           cat << 'EOF' > verify_identity.js
-          const { execSync } = require("child_process");
-          const prAuthor = (process.env.PR_AUTHOR || "").toLowerCase().trim();
+          async function main() {
+            const prAuthor = (process.env.PR_AUTHOR || "").toLowerCase().trim();
+            const prNumber = process.env.PR_NUMBER;
+            const repo = process.env.REPO_FULL_NAME;
 
-          const diffOutput = execSync("git diff --name-only origin/main...HEAD", { encoding: "utf-8" }).trim();
-          const changedFiles = diffOutput.split("\n").map(f => f.trim()).filter(Boolean);
+            const headers = {
+              "User-Agent": "Mirage-Gatekeeper",
+              "Accept": "application/vnd.github.v3+json",
+              "Authorization": `Bearer ${process.env.GITHUB_TOKEN}`
+            };
 
-          console.log(`PR Author: @${prAuthor}`);
-          console.log("Changed files:\n" + changedFiles.join("\n"));
+            const res = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}/files?per_page=100`, { headers });
+            if (!res.ok) {
+              throw new Error(`Failed to fetch PR files (HTTP ${res.status}: ${res.statusText}).`);
+            }
 
-          if (changedFiles.length === 0) {
-            throw new Error("No files were modified in this PR.");
+            const filesData = await res.json();
+            console.log(`PR Author: @${prAuthor}`);
+            console.log("Changed files:\n" + filesData.map(f => `${f.status}: ${f.filename}`).join("\n"));
+
+            if (!Array.isArray(filesData) || filesData.length === 0) {
+              throw new Error("No files were modified in this PR.");
+            }
+
+            for (const f of filesData) {
+              const file = (f.filename || "").trim();
+
+              if (f.status === "removed" || f.status === "renamed") {
+                throw new Error(`SECURITY VIOLATION: Removing or renaming files via auto-merge is not permitted (${file}).`);
+              }
+
+              // Rule 1: Only JSON files in authors/ can be modified by PRs
+              if (!file.startsWith("authors/") || !file.endsWith(".json")) {
+                throw new Error(`SECURITY VIOLATION: Pull requests can only add or modify files in authors/<author>/*.json. Forbidden file: ${file}`);
+              }
+
+              // Rule 2: Path must follow authors/<author>/<id>.json
+              const parts = file.split("/");
+              if (parts.length !== 3) {
+                throw new Error(`Invalid path structure: "${file}". Expected "authors/<author>/<id>.json".`);
+              }
+
+              const targetAuthor = parts[1].toLowerCase().trim();
+
+              // Rule 3: Protected author namespaces
+              if (targetAuthor === "local" || targetAuthor === "mirage" || targetAuthor === "official") {
+                throw new Error(`SECURITY VIOLATION: The author namespace "${targetAuthor}" is reserved.`);
+              }
+
+              // Rule 4: PR Author MUST strictly match directory name
+              if (targetAuthor !== prAuthor) {
+                throw new Error(`SECURITY VIOLATION: User @${prAuthor} is not authorized to modify files under authors/${targetAuthor}/.`);
+              }
+            }
+
+            console.log("✔ Identity verification passed: All modified files belong to @" + prAuthor);
           }
 
-          for (const file of changedFiles) {
-            // Rule 1: Only JSON files in authors/ can be modified by PRs
-            if (!file.startsWith("authors/") || !file.endsWith(".json")) {
-              throw new Error(`SECURITY VIOLATION: Pull requests can only add or modify files in authors/<author>/*.json. Forbidden file: ${file}`);
-            }
-
-            // Rule 2: Path must follow authors/<author>/<id>.json
-            const parts = file.split("/");
-            if (parts.length !== 3) {
-              throw new Error(`Invalid path structure: "${file}". Expected "authors/<author>/<id>.json".`);
-            }
-
-            const targetAuthor = parts[1].toLowerCase().trim();
-
-            // Rule 3: Protected author namespaces
-            if (targetAuthor === "local" || targetAuthor === "mirage" || targetAuthor === "official") {
-              throw new Error(`SECURITY VIOLATION: The author namespace "${targetAuthor}" is reserved.`);
-            }
-
-            // Rule 4: PR Author MUST strictly match directory name
-            if (targetAuthor !== prAuthor) {
-              throw new Error(`SECURITY VIOLATION: User @${prAuthor} is not authorized to modify files under authors/${targetAuthor}/.`);
-            }
-          }
-
-          console.log("✔ Identity verification passed: All modified files belong to @" + prAuthor);
+          main().catch((err) => {
+            console.error(err);
+            process.exit(1);
+          });
           EOF
           node verify_identity.js
           rm verify_identity.js
@@ -86,12 +112,14 @@ jobs:
       - name: Validate App Version, SHA-256 Integrity, Release Assets & AST Static Security
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO_FULL_NAME: ${{ github.repository }}
         run: |
           cat << 'EOF' > scan_security.js
-          const fs = require("fs");
           const path = require("path");
           const crypto = require("crypto");
-          const { execSync } = require("child_process");
 
           function compareSemver(aRaw, bRaw) {
             const parse = (raw) => {
@@ -207,20 +235,42 @@ jobs:
           }
 
           async function validateAll() {
-            const diffOutput = execSync("git diff --name-only origin/main...HEAD", { encoding: "utf-8" }).trim();
-            const changedFiles = diffOutput.split("\n").map(f => f.trim()).filter(Boolean);
+            const prAuthor = (process.env.PR_AUTHOR || "").toLowerCase().trim();
+            const prNumber = process.env.PR_NUMBER;
+            const headSha = process.env.PR_HEAD_SHA;
+            const repoFullName = process.env.REPO_FULL_NAME;
 
-            const headers = { "User-Agent": "Mirage-Gatekeeper", "Accept": "application/vnd.github.v3+json" };
-            if (process.env.GITHUB_TOKEN) {
-              headers["Authorization"] = `Bearer ${process.env.GITHUB_TOKEN}`;
+            const headers = {
+              "User-Agent": "Mirage-Gatekeeper",
+              "Accept": "application/vnd.github.v3+json",
+              "Authorization": `Bearer ${process.env.GITHUB_TOKEN}`
+            };
+
+            const filesRes = await fetch(`https://api.github.com/repos/${repoFullName}/pulls/${prNumber}/files?per_page=100`, { headers });
+            if (!filesRes.ok) {
+              throw new Error(`Failed to fetch PR files (HTTP ${filesRes.status}: ${filesRes.statusText}).`);
             }
+            const changedFiles = (await filesRes.json()).map(f => f.filename);
 
             const latestMirageVersion = await getLatestMirageVersion(headers);
             console.log(`Latest Mirage Editor release: v${latestMirageVersion}`);
 
             for (const file of changedFiles) {
               console.log(`\nInspecting ${file}...`);
-              const raw = fs.readFileSync(file, "utf-8");
+              const rawFileRes = await fetch(
+                `https://api.github.com/repos/${repoFullName}/contents/${file.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(headSha)}`,
+                {
+                  headers: {
+                    ...headers,
+                    "Accept": "application/vnd.github.raw+json"
+                  }
+                }
+              );
+              if (!rawFileRes.ok) {
+                throw new Error(`Failed to read ${file} from PR head ${headSha} (HTTP ${rawFileRes.status}).`);
+              }
+
+              const raw = await rawFileRes.text();
               const entry = JSON.parse(raw);
 
               const requiredFields = ["id", "name", "author", "version", "appVersion", "repo", "releaseTag", "description", "hash"];
@@ -228,6 +278,18 @@ jobs:
                 if (!entry[field]) {
                   throw new Error(`Missing required field "${field}" in ${file}`);
                 }
+              }
+
+              // Prevent author/id/repo spoofing inside the JSON payload
+              const expectedId = path.basename(file, ".json");
+              if (String(entry.author).toLowerCase().trim() !== prAuthor) {
+                throw new Error(`SECURITY VIOLATION in ${file}: entry.author ("${entry.author}") must match PR author "@${prAuthor}".`);
+              }
+              if (String(entry.id).trim() !== expectedId) {
+                throw new Error(`VALIDATION ERROR in ${file}: entry.id ("${entry.id}") must match filename "${expectedId}".`);
+              }
+              if (!String(entry.repo).toLowerCase().startsWith(`${prAuthor}/`)) {
+                throw new Error(`SECURITY VIOLATION in ${file}: entry.repo ("${entry.repo}") must be owned by "@${prAuthor}".`);
               }
 
               if (compareSemver(entry.appVersion, latestMirageVersion) < 0) {
@@ -314,7 +376,10 @@ jobs:
             console.log("\n✔ All app version checks, multi-file SHA-256 integrity checks, security scans, and release asset verifications passed!");
           }
 
-          validateAll();
+          validateAll().catch((err) => {
+            console.error(err);
+            process.exit(1);
+          });
           EOF
           node scan_security.js
           rm scan_security.js
@@ -327,17 +392,28 @@ jobs:
           echo "Approving PR..."
           gh pr review "$PR_URL" --approve --body "✅ **Automated Security Scan Passed**: Identity verified, app version confirmed, multi-file SHA-256 integrity verified, release assets validated, and AST scan clean. Auto-merging into catalog."
           echo "Merging PR..."
-          gh pr merge "$PR_URL" --squash --admin || gh pr merge "$PR_URL" --squash --auto
+          gh pr merge "$PR_URL" --squash || gh pr merge "$PR_URL" --squash --auto
 
   # ===========================================================================
-  # JOB 2: Compile SQLite (FTS5) & Blocklist Catalog on Push to Main
+  # JOB 2: Compile SQLite (FTS5) & Blocklist Catalog on Merge / Push to Main
   # ===========================================================================
   build-catalog:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: [validate-and-merge]
+    if: |
+      always() && (
+        github.event_name == 'push' ||
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'pull_request_target' && needs.validate-and-merge.result == 'success')
+      )
+    concurrency:
+      group: build-catalog
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout Main Repository
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Setup Node.js & SQLite
         uses: actions/setup-node@v4
@@ -466,4 +542,8 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add catalog.sqlite
-          git diff --staged --quiet || (git commit -m "Auto-compile catalog.sqlite [skip ci]" && git push)
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-compile catalog.sqlite [skip ci]"
+            git pull --rebase origin main || true
+            git push
+          fi
