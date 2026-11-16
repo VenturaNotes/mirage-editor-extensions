@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   # ===========================================================================
-  # JOB 1: Pull Request Gatekeeper (Identity, Integrity, Security, & Merge)
+  # JOB 1: Pull Request Gatekeeper (1-PR Limit, Identity, Integrity, & Merge)
   # ===========================================================================
   validate-and-merge:
     if: github.event_name == 'pull_request_target'
@@ -32,6 +32,10 @@ jobs:
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            mirage-editor
+            mirage-editor-extensions
 
       - name: Checkout Trusted Base Branch
         uses: actions/checkout@v4
@@ -41,7 +45,7 @@ jobs:
         with:
           node-version: 24
 
-      - name: Verify Identity, App Version, Integrity & AST Security
+      - name: Verify 1-PR Limit, Identity, App Version, Integrity & AST Security
         env:
           REPO_TOKEN: ${{ steps.app-token.outputs.token }}
           CROSS_REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -169,7 +173,7 @@ jobs:
 
           async function main() {
             const prAuthor = (process.env.PR_AUTHOR || "").toLowerCase().trim();
-            const prNumber = process.env.PR_NUMBER;
+            const prNumber = Number(process.env.PR_NUMBER);
             const headSha = process.env.PR_HEAD_SHA;
             const repoFullName = process.env.REPO_FULL_NAME;
 
@@ -184,6 +188,39 @@ jobs:
               "Authorization": `Bearer ${process.env.CROSS_REPO_TOKEN}`
             };
 
+            // 1. Enforce 1 active PR at a time per author (reject & close newer duplicates)
+            const openPrsRes = await fetch(
+              `https://api.github.com/repos/${repoFullName}/pulls?state=open&per_page=100`,
+              { headers: repoHeaders }
+            );
+            if (openPrsRes.ok) {
+              const openPrs = await openPrsRes.json();
+              const olderOpen = openPrs.filter(
+                (p) =>
+                  p.user &&
+                  String(p.user.login || "").toLowerCase().trim() === prAuthor &&
+                  Number(p.number) < prNumber
+              );
+              if (olderOpen.length > 0) {
+                const existing = olderOpen[0];
+                const msg = `⚠️ **One Submission at a Time**: @${prAuthor} already has an open pull request (#${existing.number}). Please wait for #${existing.number} to merge, or close it before submitting another extension.`;
+                try {
+                  await fetch(`https://api.github.com/repos/${repoFullName}/issues/${prNumber}/comments`, {
+                    method: "POST",
+                    headers: { ...repoHeaders, "Content-Type": "application/json" },
+                    body: JSON.stringify({ body: msg })
+                  });
+                  await fetch(`https://api.github.com/repos/${repoFullName}/pulls/${prNumber}`, {
+                    method: "PATCH",
+                    headers: { ...repoHeaders, "Content-Type": "application/json" },
+                    body: JSON.stringify({ state: "closed" })
+                  });
+                } catch (_) {}
+                throw new Error(msg);
+              }
+            }
+
+            // 2. Fetch changed files and verify author identity
             const filesRes = await fetch(`https://api.github.com/repos/${repoFullName}/pulls/${prNumber}/files?per_page=100`, { headers: repoHeaders });
             if (!filesRes.ok) {
               throw new Error(`Failed to fetch PR files (HTTP ${filesRes.status}: ${filesRes.statusText}).`);
@@ -217,9 +254,11 @@ jobs:
             }
             console.log(`✔ Identity verified for @${prAuthor}`);
 
-            const latestMirageVersion = await getLatestMirageVersion(crossRepoHeaders);
+            // 3. Check Mirage Editor version using APP_TOKEN (5,000/hr)
+            const latestMirageVersion = await getLatestMirageVersion(repoHeaders);
             console.log(`Latest Mirage Editor release: v${latestMirageVersion}`);
 
+            // 4. Verify each changed extension entry + release assets + AST security
             for (const f of filesData) {
               const file = f.filename;
               console.log(`\nInspecting ${file}...`);
@@ -502,7 +541,7 @@ jobs:
             db.close();
           }
 
-          console.log(`✔ Compiled catalog.sqlite with ${registry.length} extensions, FTS5 index, and blocklist table.`);
+          console.log(`✔ Compiled catalog.sqlite with ${registry.length} extensions using prepared statements.`);
           EOF
           node compile_catalog.js
           rm compile_catalog.js
@@ -511,10 +550,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          if gh release view catalog-latest >/dev/null 2>&1; then
-            gh release upload catalog-latest catalog.sqlite --clobber
-          else
+          gh release upload catalog-latest catalog.sqlite --clobber || \
             gh release create catalog-latest catalog.sqlite \
               --title "Extension Catalog (Latest)" \
               --notes "Auto-compiled SQLite (FTS5) extension catalog for Mirage Editor."
-          fi
