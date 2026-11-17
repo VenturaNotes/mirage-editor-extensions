@@ -545,7 +545,7 @@ jobs:
           const zlib = require("zlib");
           const { DatabaseSync } = require("node:sqlite");
 
-          const MAX_DELTA_ENTRIES = 5000;
+          const MAX_DELTA_ENTRIES = 8000;
 
           function rowFingerprint(item) {
             return JSON.stringify([
