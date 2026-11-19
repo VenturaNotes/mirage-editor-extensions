@@ -306,17 +306,12 @@ jobs:
               const db = new DatabaseSync(dbFile, { readOnly: true });
               const hasExt = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='extensions'").all();
               if (hasExt.length > 0) {
-                const cols = db.prepare("PRAGMA table_info(extensions)").all().map((c) => c.name);
                 catalogHandle = {
                   db,
                   dbFile,
                   checkRawStmt: db.prepare("SELECT author, id FROM extensions WHERE hash = ?"),
-                  checkNormStmt: cols.includes("normalized_hash")
-                    ? db.prepare("SELECT author, id FROM extensions WHERE normalized_hash = ?")
-                    : null,
-                  checkSelfStmt: cols.includes("normalized_hash")
-                    ? db.prepare("SELECT hash, normalized_hash FROM extensions WHERE LOWER(author) = ? AND id = ? LIMIT 1")
-                    : db.prepare("SELECT hash FROM extensions WHERE LOWER(author) = ? AND id = ? LIMIT 1"),
+                  checkNormStmt: db.prepare("SELECT author, id FROM extensions WHERE normalized_hash = ?"),
+                  checkSelfStmt: db.prepare("SELECT hash, normalized_hash FROM extensions WHERE author = ? AND id = ? LIMIT 1"),
                 };
               } else {
                 db.close();
@@ -518,7 +513,7 @@ jobs:
                   throw new PermanentRejectionError(`Invalid JSON syntax in ${file}: ${e.message}`);
                 }
 
-                const requiredFields = ["id", "name", "author", "version", "appVersion", "repo", "releaseTag", "description", "hash"];
+                const requiredFields = ["id", "name", "author", "version", "appVersion", "repo", "releaseTag", "description", "hash", "normalizedHash"];
                 for (const field of requiredFields) {
                   if (!entry[field]) {
                     throw new PermanentRejectionError(`Missing required field "${field}" in ${file}`);
@@ -607,7 +602,7 @@ jobs:
 
                     if (relPath === "main.js") {
                       const actualNormHash = computeNormalizedJsHash(jsCode);
-                      if (entry.normalizedHash && actualNormHash !== String(entry.normalizedHash).trim().toLowerCase()) {
+                      if (actualNormHash !== String(entry.normalizedHash).trim().toLowerCase()) {
                         throw new PermanentRejectionError(
                           `INTEGRITY VIOLATION in ${file}: normalizedHash of main.js (${actualNormHash}) does not match entry.normalizedHash (${entry.normalizedHash}).`
                         );
@@ -655,18 +650,16 @@ jobs:
                             );
                           }
 
-                          if (catalogHandle.checkNormStmt) {
-                            const normRows = catalogHandle.checkNormStmt.all(actualNormHash);
-                            const normDup = normRows.find((r) => {
-                              const a = String(r.author || "").toLowerCase();
-                              const k = `${a}/${r.id}`;
-                              return a !== prAuthor && !recentRemovedKeys.has(k) && !recentUpserts.has(k);
-                            });
-                            if (normDup) {
-                              throw new PermanentRejectionError(
-                                `DUPLICATE VIOLATION in ${file}: main.js code (comments and whitespace normalized) matches existing extension @${String(normDup.author).toLowerCase()}/${normDup.id}. Please make meaningful code changes before publishing.`
-                              );
-                            }
+                          const normRows = catalogHandle.checkNormStmt.all(actualNormHash);
+                          const normDup = normRows.find((r) => {
+                            const a = String(r.author || "").toLowerCase();
+                            const k = `${a}/${r.id}`;
+                            return a !== prAuthor && !recentRemovedKeys.has(k) && !recentUpserts.has(k);
+                          });
+                          if (normDup) {
+                            throw new PermanentRejectionError(
+                              `DUPLICATE VIOLATION in ${file}: main.js code (comments and whitespace normalized) matches existing extension @${String(normDup.author).toLowerCase()}/${normDup.id}. Please make meaningful code changes before publishing.`
+                            );
                           }
                         }
                       }
@@ -1003,8 +996,6 @@ jobs:
             let prevSqliteBuf = await downloadPrevAsset(repo, "catalog.sqlite.gz");
             if (prevSqliteBuf) {
               prevSqliteBuf = zlib.gunzipSync(prevSqliteBuf);
-            } else {
-              prevSqliteBuf = await downloadPrevAsset(repo, "catalog.sqlite");
             }
 
             const blocklist = readBlocklist();
@@ -1016,11 +1007,7 @@ jobs:
               try {
                 fs.writeFileSync(dbPath, prevSqliteBuf);
                 const incDb = new DatabaseSync(dbPath);
-                const cols = incDb.prepare("PRAGMA table_info(extensions)").all().map((c) => c.name);
-                const hasNormHashCol = cols.includes("normalized_hash");
-
-                if (hasNormHashCol) {
-                  let changedFiles = [];
+                let changedFiles = [];
                   if (prevBuiltCommitSha !== currentCommitSha) {
                     const headers = {
                       "User-Agent": "Mirage-Catalog-Builder",
@@ -1082,8 +1069,6 @@ jobs:
                   incDb.close();
                   finalizeArtifacts(incDb, dbPath, deltaMap, prevDeltaStartSeq, nextSeq, totalCount, blocklist, currentCommitSha);
                   return;
-                }
-                incDb.close();
               } catch (incErr) {
                 console.warn("[build-catalog] Incremental path skipped, falling back to full rebuild:", incErr.message || incErr);
                 if (fs.existsSync(dbPath)) {
