@@ -141,10 +141,28 @@ jobs:
           REPO_FULL_NAME: ${{ github.repository }}
         run: |
           cat << 'EOF' > validate_pr.js
+          const fs = require("fs");
           const path = require("path");
           const crypto = require("crypto");
 
           class PermanentRejectionError extends Error {}
+
+          function stripJsCommentsAndWhitespace(code) {
+            const tokenRegex = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*)/g;
+            const withoutComments = String(code || "").replace(tokenRegex, (match) => {
+              if (match.startsWith("//") || match.startsWith("/*")) return " ";
+              return match;
+            });
+            return withoutComments.replace(/\s+/g, " ").trim();
+          }
+
+          function computeNormalizedJsHash(code) {
+            return crypto
+              .createHash("sha256")
+              .update(stripJsCommentsAndWhitespace(code), "utf-8")
+              .digest("hex")
+              .toLowerCase();
+          }
 
           function compareSemver(aRaw, bRaw) {
             const parse = (raw) => {
@@ -259,6 +277,36 @@ jobs:
             return clean;
           }
 
+          function buildExistingHashIndex() {
+            const rawMap = new Map();
+            const normMap = new Map();
+            if (!fs.existsSync("authors")) return { rawMap, normMap };
+
+            for (const authorDir of fs.readdirSync("authors", { withFileTypes: true })) {
+              if (!authorDir.isDirectory() || authorDir.name.startsWith(".")) continue;
+              const otherAuthor = authorDir.name.toLowerCase();
+              const dirPath = path.join("authors", authorDir.name);
+
+              for (const jf of fs.readdirSync(dirPath)) {
+                if (!jf.endsWith(".json")) continue;
+                try {
+                  const meta = JSON.parse(fs.readFileSync(path.join(dirPath, jf), "utf-8"));
+                  const otherId = path.basename(jf, ".json");
+                  const label = `@${otherAuthor}/${otherId}`;
+                  if (meta.hash) {
+                    const h = String(meta.hash).trim().toLowerCase();
+                    if (!rawMap.has(h)) rawMap.set(h, { author: otherAuthor, label });
+                  }
+                  if (meta.normalizedHash) {
+                    const nh = String(meta.normalizedHash).trim().toLowerCase();
+                    if (!normMap.has(nh)) normMap.set(nh, { author: otherAuthor, label });
+                  }
+                } catch (_) {}
+              }
+            }
+            return { rawMap, normMap };
+          }
+
           async function closeRejectedPr(repoFullName, prNumber, repoHeaders, reason) {
             try {
               await fetch(`https://api.github.com/repos/${repoFullName}/issues/${prNumber}/comments`, {
@@ -354,7 +402,10 @@ jobs:
               const latestMirageVersion = await getLatestMirageVersion(repoHeaders);
               console.log(`Latest Mirage Editor release: v${latestMirageVersion}`);
 
-              // 4. Verify entry, release assets, SHA-256 & AST security
+              // 3.5. Build index of existing raw & normalized main.js hashes across catalog
+              const { rawMap: existingRawHashes, normMap: existingNormalizedHashes } = buildExistingHashIndex();
+
+              // 4. Verify entry, release assets, SHA-256, duplicate gate & AST security
               for (const f of filesData) {
                 const file = f.filename;
                 console.log(`\nInspecting ${file}...`);
@@ -468,6 +519,30 @@ jobs:
                     const jsCode = fileBuf.toString("utf-8");
                     scanSecurity(jsCode, `${entry.id}/${relPath}`);
                     combinedJsCode += `\n// ${relPath}\n${jsCode}`;
+
+                    if (relPath === "main.js") {
+                      const actualNormHash = computeNormalizedJsHash(jsCode);
+                      if (entry.normalizedHash && actualNormHash !== String(entry.normalizedHash).trim().toLowerCase()) {
+                        throw new PermanentRejectionError(
+                          `INTEGRITY VIOLATION in ${file}: normalizedHash of main.js (${actualNormHash}) does not match entry.normalizedHash (${entry.normalizedHash}).`
+                        );
+                      }
+
+                      const rawDup = existingRawHashes.get(fileSha);
+                      if (rawDup && rawDup.author !== prAuthor) {
+                        throw new PermanentRejectionError(
+                          `DUPLICATE VIOLATION in ${file}: main.js SHA-256 matches existing extension ${rawDup.label}. Unmodified copies cannot be published.`
+                        );
+                      }
+
+                      const normDup = existingNormalizedHashes.get(actualNormHash);
+                      if (normDup && normDup.author !== prAuthor) {
+                        throw new PermanentRejectionError(
+                          `DUPLICATE VIOLATION in ${file}: main.js code (comments and whitespace normalized) matches existing extension ${normDup.label}. Please make meaningful code changes before publishing.`
+                        );
+                      }
+                      console.log(`✔ Uniqueness / anti-clone check passed for main.js`);
+                    }
                   }
                 }
 
@@ -499,7 +574,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
-          gh pr review "$PR_URL" --approve --body "✅ **Automated Security Scan Passed**: Identity verified, app version confirmed, multi-file SHA-256 integrity verified, release assets validated, and AST scan clean. Auto-merging into catalog."
+          gh pr review "$PR_URL" --approve --body "✅ **Automated Security Scan Passed**: Identity verified, app version confirmed, multi-file SHA-256 integrity verified, uniqueness check passed, release assets validated, and AST scan clean. Auto-merging into catalog."
           gh pr merge "$PR_URL" --squash || gh pr merge "$PR_URL" --squash --auto
 
   # ===========================================================================
@@ -558,6 +633,7 @@ jobs:
               item.search_keywords || "",
               Number(item.downloads || 0),
               item.hash || "",
+              item.normalized_hash || item.normalizedHash || "",
               item.files || "[]",
               item.file_hashes || "{}",
               Number(item.updated_at || item.updatedAt || 0)
@@ -674,6 +750,7 @@ jobs:
                 search_keywords TEXT,
                 downloads INTEGER DEFAULT 0,
                 hash TEXT,
+                normalized_hash TEXT,
                 files TEXT,
                 file_hashes TEXT,
                 updated_at INTEGER,
@@ -682,6 +759,8 @@ jobs:
               CREATE INDEX idx_extensions_downloads ON extensions(downloads DESC);
               CREATE INDEX idx_extensions_updated ON extensions(updated_at DESC);
               CREATE INDEX idx_extensions_author ON extensions(author);
+              CREATE INDEX idx_extensions_hash ON extensions(hash);
+              CREATE INDEX idx_extensions_norm_hash ON extensions(normalized_hash);
               CREATE VIRTUAL TABLE extensions_fts USING fts5(
                 id, name, author, description, search_keywords, capabilities,
                 content='extensions', content_rowid='rowid'
@@ -694,8 +773,8 @@ jobs:
             `);
 
             const insertExt = db.prepare(`
-              INSERT INTO extensions (id, name, author, version, description, repo, release_tag, capabilities, search_keywords, downloads, hash, files, file_hashes, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              INSERT INTO extensions (id, name, author, version, description, repo, release_tag, capabilities, search_keywords, downloads, hash, normalized_hash, files, file_hashes, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `);
             const insertFts = db.prepare(`
               INSERT INTO extensions_fts(rowid, id, name, author, description, search_keywords, capabilities)
@@ -720,6 +799,7 @@ jobs:
                 const releaseTag = String(item.releaseTag || "");
                 const version = String(item.version || "");
                 const hash = String(item.hash || "");
+                const normalizedHash = String(item.normalizedHash || "");
                 const filesJson = JSON.stringify(item.files || []);
                 const fileHashesJson = JSON.stringify(item.fileHashes || {});
                 const updatedAt = Number(item.updatedAt || Date.now());
@@ -727,7 +807,7 @@ jobs:
 
                 const res = insertExt.run(
                   id, name, author, version, desc, repoField, releaseTag,
-                  capsStr, kwStr, downloads, hash, filesJson, fileHashesJson, updatedAt
+                  capsStr, kwStr, downloads, hash, normalizedHash, filesJson, fileHashesJson, updatedAt
                 );
                 insertFts.run(res.lastInsertRowid, id, name, author, desc, kwStr, capsStr);
 
@@ -736,7 +816,7 @@ jobs:
                 const curFp = rowFingerprint({
                   name, version, description: desc, repo: repoField,
                   release_tag: releaseTag, capabilities: capsStr, search_keywords: kwStr,
-                  downloads, hash, files: filesJson, file_hashes: fileHashesJson, updated_at: updatedAt
+                  downloads, hash, normalized_hash: normalizedHash, files: filesJson, file_hashes: fileHashesJson, updated_at: updatedAt
                 });
 
                 const prevInfo = prevFingerprints.get(mapKey);
@@ -747,7 +827,7 @@ jobs:
                     op: "upsert",
                     id, name, author, version, description: desc, repo: repoField,
                     release_tag: releaseTag, capabilities: capsStr, search_keywords: kwStr,
-                    downloads, hash, files: filesJson, file_hashes: fileHashesJson, updated_at: updatedAt
+                    downloads, hash, normalized_hash: normalizedHash, files: filesJson, file_hashes: fileHashesJson, updated_at: updatedAt
                   });
                 }
               }
