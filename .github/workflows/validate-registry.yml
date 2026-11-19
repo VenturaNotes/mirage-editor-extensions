@@ -106,7 +106,7 @@ jobs:
           rm sweep.js
 
   # ===========================================================================
-  # JOB 1: Pull Request Gatekeeper (1-PR Limit, Identity, Integrity, & Merge)
+  # JOB 1: Parallel PR Gatekeeper (Identity, Integrity, Catalog + Compare, AST)
   # ===========================================================================
   validate-and-merge:
     if: github.event_name == 'pull_request_target'
@@ -122,9 +122,6 @@ jobs:
           repositories: |
             mirage-editor
             mirage-editor-extensions
-
-      - name: Checkout Trusted Base Branch
-        uses: actions/checkout@v6
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -143,7 +140,9 @@ jobs:
           cat << 'EOF' > validate_pr.js
           const fs = require("fs");
           const path = require("path");
+          const zlib = require("zlib");
           const crypto = require("crypto");
+          const { DatabaseSync } = require("node:sqlite");
 
           class PermanentRejectionError extends Error {}
 
@@ -277,34 +276,116 @@ jobs:
             return clean;
           }
 
-          function buildExistingHashIndex() {
-            const rawMap = new Map();
-            const normMap = new Map();
-            if (!fs.existsSync("authors")) return { rawMap, normMap };
+          async function loadCatalogAndRecentDelta(repoFullName, repoHeaders) {
+            let catalogHandle = null;
+            let builtCommitSha = "";
 
-            for (const authorDir of fs.readdirSync("authors", { withFileTypes: true })) {
-              if (!authorDir.isDirectory() || authorDir.name.startsWith(".")) continue;
-              const otherAuthor = authorDir.name.toLowerCase();
-              const dirPath = path.join("authors", authorDir.name);
+            const [gzRes, metaRes] = await Promise.all([
+              fetch(`https://github.com/${repoFullName}/releases/download/catalog-latest/catalog.sqlite.gz`),
+              fetch(`https://github.com/${repoFullName}/releases/download/catalog-latest/catalog-meta.json`),
+            ]);
 
-              for (const jf of fs.readdirSync(dirPath)) {
-                if (!jf.endsWith(".json")) continue;
-                try {
-                  const meta = JSON.parse(fs.readFileSync(path.join(dirPath, jf), "utf-8"));
-                  const otherId = path.basename(jf, ".json");
-                  const label = `@${otherAuthor}/${otherId}`;
-                  if (meta.hash) {
-                    const h = String(meta.hash).trim().toLowerCase();
-                    if (!rawMap.has(h)) rawMap.set(h, { author: otherAuthor, label });
-                  }
-                  if (meta.normalizedHash) {
-                    const nh = String(meta.normalizedHash).trim().toLowerCase();
-                    if (!normMap.has(nh)) normMap.set(nh, { author: otherAuthor, label });
-                  }
-                } catch (_) {}
+            if (metaRes.ok) {
+              try {
+                const meta = await metaRes.json();
+                if (meta && typeof meta.builtCommitSha === "string") {
+                  builtCommitSha = meta.builtCommitSha.trim();
+                }
+              } catch (_) {}
+            }
+
+            if (gzRes.status !== 404) {
+              if (!gzRes.ok) {
+                throw new Error(`Transient error downloading catalog.sqlite.gz (HTTP ${gzRes.status}: ${gzRes.statusText}).`);
+              }
+              const gzBuf = Buffer.from(await gzRes.arrayBuffer());
+              const sqliteBuf = zlib.gunzipSync(gzBuf);
+              const dbFile = "gatekeeper_catalog.sqlite";
+              fs.writeFileSync(dbFile, sqliteBuf);
+
+              const db = new DatabaseSync(dbFile, { readOnly: true });
+              const hasExt = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='extensions'").all();
+              if (hasExt.length > 0) {
+                const cols = db.prepare("PRAGMA table_info(extensions)").all().map((c) => c.name);
+                catalogHandle = {
+                  db,
+                  dbFile,
+                  checkRawStmt: db.prepare("SELECT author, id FROM extensions WHERE hash = ?"),
+                  checkNormStmt: cols.includes("normalized_hash")
+                    ? db.prepare("SELECT author, id FROM extensions WHERE normalized_hash = ?")
+                    : null,
+                  checkSelfStmt: cols.includes("normalized_hash")
+                    ? db.prepare("SELECT hash, normalized_hash FROM extensions WHERE LOWER(author) = ? AND id = ? LIMIT 1")
+                    : db.prepare("SELECT hash FROM extensions WHERE LOWER(author) = ? AND id = ? LIMIT 1"),
+                };
+              } else {
+                db.close();
+                try { fs.unlinkSync(dbFile); } catch (_) {}
               }
             }
-            return { rawMap, normMap };
+
+            const recentUpserts = new Map();
+            const recentRemovedKeys = new Set();
+
+            if (builtCommitSha) {
+              const cmpRes = await fetch(
+                `https://api.github.com/repos/${repoFullName}/compare/${encodeURIComponent(builtCommitSha)}...main`,
+                { headers: repoHeaders }
+              );
+              if (cmpRes.ok) {
+                const cmpData = await cmpRes.json();
+                const changedFiles = Array.isArray(cmpData.files) ? cmpData.files : [];
+                for (const f of changedFiles) {
+                  if (f.previous_filename && f.previous_filename.startsWith("authors/") && f.previous_filename.endsWith(".json")) {
+                    const prevParts = f.previous_filename.split("/");
+                    if (prevParts.length === 3) {
+                      recentRemovedKeys.add(`${prevParts[1].toLowerCase()}/${path.basename(prevParts[2], ".json")}`);
+                    }
+                  }
+                  const fn = String(f.filename || "").trim();
+                  if (!fn.startsWith("authors/") || !fn.endsWith(".json")) continue;
+                  const parts = fn.split("/");
+                  if (parts.length !== 3) continue;
+                  const rAuthor = parts[1].toLowerCase();
+                  const rId = path.basename(parts[2], ".json");
+                  const rKey = `${rAuthor}/${rId}`;
+
+                  if (f.status === "removed") {
+                    recentRemovedKeys.add(rKey);
+                    recentUpserts.delete(rKey);
+                    continue;
+                  }
+
+                  let jsonText = "";
+                  if (f.raw_url) {
+                    const rRes = await fetch(f.raw_url);
+                    if (rRes.ok) jsonText = await rRes.text();
+                  }
+                  if (!jsonText) {
+                    const cRes = await fetch(
+                      `https://api.github.com/repos/${repoFullName}/contents/${fn.split("/").map(encodeURIComponent).join("/")}?ref=main`,
+                      { headers: { ...repoHeaders, "Accept": "application/vnd.github.raw+json" } }
+                    );
+                    if (cRes.ok) jsonText = await cRes.text();
+                  }
+                  if (jsonText) {
+                    try {
+                      const parsed = JSON.parse(jsonText);
+                      recentUpserts.set(rKey, {
+                        author: rAuthor,
+                        id: rId,
+                        hash: String(parsed.hash || "").trim().toLowerCase(),
+                        normalizedHash: String(parsed.normalizedHash || "").trim().toLowerCase(),
+                      });
+                    } catch (_) {}
+                  }
+                }
+              } else if (cmpRes.status !== 404) {
+                throw new Error(`Transient error comparing ${builtCommitSha}...main (HTTP ${cmpRes.status}).`);
+              }
+            }
+
+            return { catalogHandle, recentUpserts, recentRemovedKeys };
           }
 
           async function closeRejectedPr(repoFullName, prNumber, repoHeaders, reason) {
@@ -340,6 +421,8 @@ jobs:
               "Accept": "application/vnd.github.v3+json",
               "Authorization": `Bearer ${process.env.CROSS_REPO_TOKEN}`
             };
+
+            let catalogHandle = null;
 
             try {
               // 1. Enforce 1 active PR at a time per author
@@ -398,12 +481,14 @@ jobs:
               }
               console.log(`✔ Identity verified for @${prAuthor}`);
 
-              // 3. Check Mirage Editor version using APP_TOKEN
+              // 3. Check Mirage Editor version & load catalog.sqlite.gz + compare delta
               const latestMirageVersion = await getLatestMirageVersion(repoHeaders);
               console.log(`Latest Mirage Editor release: v${latestMirageVersion}`);
 
-              // 3.5. Build index of existing raw & normalized main.js hashes across catalog
-              const { rawMap: existingRawHashes, normMap: existingNormalizedHashes } = buildExistingHashIndex();
+              const loaded = await loadCatalogAndRecentDelta(repoFullName, repoHeaders);
+              catalogHandle = loaded.catalogHandle;
+              const recentUpserts = loaded.recentUpserts;
+              const recentRemovedKeys = loaded.recentRemovedKeys;
 
               // 4. Verify entry, release assets, SHA-256, duplicate gate & AST security
               for (const f of filesData) {
@@ -528,18 +613,62 @@ jobs:
                         );
                       }
 
-                      const rawDup = existingRawHashes.get(fileSha);
-                      if (rawDup && rawDup.author !== prAuthor) {
-                        throw new PermanentRejectionError(
-                          `DUPLICATE VIOLATION in ${file}: main.js SHA-256 matches existing extension ${rawDup.label}. Unmodified copies cannot be published.`
-                        );
-                      }
+                      const selfKey = `${prAuthor}/${expectedId}`;
+                      const recentSelf = recentUpserts.get(selfKey);
+                      const dbSelf = !recentRemovedKeys.has(selfKey) && catalogHandle
+                        ? catalogHandle.checkSelfStmt.get(prAuthor, expectedId)
+                        : null;
+                      const selfSource = recentSelf || dbSelf;
+                      const selfUnchanged = Boolean(
+                        selfSource &&
+                        (
+                          (selfSource.hash && String(selfSource.hash).toLowerCase() === fileSha) ||
+                          ((selfSource.normalizedHash || selfSource.normalized_hash) &&
+                            String(selfSource.normalizedHash || selfSource.normalized_hash).toLowerCase() === actualNormHash)
+                        )
+                      );
 
-                      const normDup = existingNormalizedHashes.get(actualNormHash);
-                      if (normDup && normDup.author !== prAuthor) {
-                        throw new PermanentRejectionError(
-                          `DUPLICATE VIOLATION in ${file}: main.js code (comments and whitespace normalized) matches existing extension ${normDup.label}. Please make meaningful code changes before publishing.`
-                        );
+                      if (!selfUnchanged) {
+                        for (const r of recentUpserts.values()) {
+                          if (r.author !== prAuthor && r.hash && r.hash === fileSha) {
+                            throw new PermanentRejectionError(
+                              `DUPLICATE VIOLATION in ${file}: main.js SHA-256 matches recently merged extension @${r.author}/${r.id}. Unmodified copies cannot be published.`
+                            );
+                          }
+                          if (r.author !== prAuthor && r.normalizedHash && r.normalizedHash === actualNormHash) {
+                            throw new PermanentRejectionError(
+                              `DUPLICATE VIOLATION in ${file}: main.js code (comments and whitespace normalized) matches recently merged extension @${r.author}/${r.id}. Please make meaningful code changes before publishing.`
+                            );
+                          }
+                        }
+
+                        if (catalogHandle) {
+                          const rawRows = catalogHandle.checkRawStmt.all(fileSha);
+                          const rawDup = rawRows.find((r) => {
+                            const a = String(r.author || "").toLowerCase();
+                            const k = `${a}/${r.id}`;
+                            return a !== prAuthor && !recentRemovedKeys.has(k) && !recentUpserts.has(k);
+                          });
+                          if (rawDup) {
+                            throw new PermanentRejectionError(
+                              `DUPLICATE VIOLATION in ${file}: main.js SHA-256 matches existing extension @${String(rawDup.author).toLowerCase()}/${rawDup.id}. Unmodified copies cannot be published.`
+                            );
+                          }
+
+                          if (catalogHandle.checkNormStmt) {
+                            const normRows = catalogHandle.checkNormStmt.all(actualNormHash);
+                            const normDup = normRows.find((r) => {
+                              const a = String(r.author || "").toLowerCase();
+                              const k = `${a}/${r.id}`;
+                              return a !== prAuthor && !recentRemovedKeys.has(k) && !recentUpserts.has(k);
+                            });
+                            if (normDup) {
+                              throw new PermanentRejectionError(
+                                `DUPLICATE VIOLATION in ${file}: main.js code (comments and whitespace normalized) matches existing extension @${String(normDup.author).toLowerCase()}/${normDup.id}. Please make meaningful code changes before publishing.`
+                              );
+                            }
+                          }
+                        }
                       }
                       console.log(`✔ Uniqueness / anti-clone check passed for main.js`);
                     }
@@ -561,6 +690,11 @@ jobs:
                 console.error("TRANSIENT / RATE-LIMIT ERROR (leaving PR open for sweep):", err);
               }
               process.exit(1);
+            } finally {
+              if (catalogHandle) {
+                try { catalogHandle.db.close(); } catch (_) {}
+                try { fs.unlinkSync(catalogHandle.dbFile); } catch (_) {}
+              }
             }
           }
 
@@ -578,7 +712,7 @@ jobs:
           gh pr merge "$PR_URL" --squash || gh pr merge "$PR_URL" --squash --auto
 
   # ===========================================================================
-  # JOB 2: Compile SQLite + Gzipped Snapshot + Meta + Rolling Deduplicated Delta
+  # JOB 2: Incremental SQLite + Gzipped Snapshot + Meta + Rolling Delta
   # ===========================================================================
   build-catalog:
     needs: [validate-and-merge]
@@ -612,12 +746,15 @@ jobs:
 
       - name: Compile catalog.sqlite.gz, catalog-meta.json & catalog-delta.jsonl.gz
         env:
+          REPO_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO_FULL_NAME: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           cat << 'EOF' > compile_catalog.js
           const fs = require("fs");
           const path = require("path");
           const zlib = require("zlib");
+          const { execSync } = require("child_process");
           const { DatabaseSync } = require("node:sqlite");
 
           const MAX_DELTA_ENTRIES = 8000;
@@ -632,8 +769,8 @@ jobs:
               item.capabilities || "",
               item.search_keywords || "",
               Number(item.downloads || 0),
-              item.hash || "",
-              item.normalized_hash || item.normalizedHash || "",
+              String(item.hash || "").trim().toLowerCase(),
+              String(item.normalized_hash || item.normalizedHash || "").trim().toLowerCase(),
               item.files || "[]",
               item.file_hashes || "{}",
               Number(item.updated_at || item.updatedAt || 0)
@@ -648,12 +785,195 @@ jobs:
             return null;
           }
 
+          function readBlocklist() {
+            const blocklist = [];
+            if (fs.existsSync("blocklist.txt")) {
+              const lines = fs.readFileSync("blocklist.txt", "utf-8").split("\n").map((l) => l.trim()).filter(Boolean);
+              blocklist.push(...lines);
+            }
+            return blocklist;
+          }
+
+          function getCurrentCommitSha() {
+            if (process.env.CURRENT_SHA) return process.env.CURRENT_SHA.trim();
+            try {
+              return execSync("git rev-parse HEAD", { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+            } catch (_) {
+              return "";
+            }
+          }
+
+          function finalizeArtifacts(db, dbPath, deltaMap, prevDeltaStartSeq, nextSeq, totalCount, blocklist, currentCommitSha) {
+            const sqliteBytes = fs.readFileSync(dbPath);
+            const gzSqlite = zlib.gzipSync(sqliteBytes, { level: 9 });
+            fs.writeFileSync("catalog.sqlite.gz", gzSqlite);
+
+            let deltaList = Array.from(deltaMap.values()).sort((a, b) => a.seq - b.seq);
+            let deltaStartSeq = prevDeltaStartSeq || 1;
+            if (deltaList.length > MAX_DELTA_ENTRIES) {
+              const dropCount = deltaList.length - MAX_DELTA_ENTRIES;
+              const maxDroppedSeq = deltaList[dropCount - 1].seq;
+              deltaList = deltaList.slice(dropCount);
+              deltaStartSeq = Math.max(deltaStartSeq, maxDroppedSeq + 1);
+            }
+            if (nextSeq === 0) deltaStartSeq = 1;
+
+            const deltaText = deltaList.map((d) => JSON.stringify(d)).join("\n") + (deltaList.length ? "\n" : "");
+            fs.writeFileSync("catalog-delta.jsonl.gz", zlib.gzipSync(Buffer.from(deltaText, "utf-8"), { level: 9 }));
+
+            const metaObj = {
+              latestSeq: nextSeq,
+              deltaStartSeq,
+              totalCount,
+              blocklist,
+              builtCommitSha: currentCommitSha || undefined,
+              updatedAt: Date.now()
+            };
+            fs.writeFileSync("catalog-meta.json", JSON.stringify(metaObj), "utf-8");
+
+            console.log(`✔ Built catalog.sqlite.gz (${(gzSqlite.length / 1024).toFixed(1)} KB), delta (${deltaList.length} entries), latestSeq=${nextSeq}, totalCount=${totalCount}.`);
+          }
+
+          function applyIncrementalChanges(db, changedEntries, deletedKeys, blocklist, deltaMap, startSeq) {
+            const selectExisting = db.prepare(
+              "SELECT rowid, id, name, author, version, description, repo, release_tag, capabilities, search_keywords, downloads, hash, normalized_hash, files, file_hashes, updated_at FROM extensions WHERE LOWER(author) = LOWER(?) AND id = ?"
+            );
+            const deleteFts = db.prepare(
+              "INSERT INTO extensions_fts(extensions_fts, rowid, id, name, author, description, search_keywords, capabilities) VALUES('delete', ?, ?, ?, ?, ?, ?, ?)"
+            );
+            const deleteExt = db.prepare("DELETE FROM extensions WHERE rowid = ?");
+            const upsertExt = db.prepare(`
+              INSERT INTO extensions (id, name, author, version, description, repo, release_tag, capabilities, search_keywords, downloads, hash, normalized_hash, files, file_hashes, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(author, id) DO UPDATE SET
+                name = excluded.name,
+                version = excluded.version,
+                description = excluded.description,
+                repo = excluded.repo,
+                release_tag = excluded.release_tag,
+                capabilities = excluded.capabilities,
+                search_keywords = excluded.search_keywords,
+                downloads = excluded.downloads,
+                hash = excluded.hash,
+                normalized_hash = excluded.normalized_hash,
+                files = excluded.files,
+                file_hashes = excluded.file_hashes,
+                updated_at = excluded.updated_at
+            `);
+            const selectRowId = db.prepare("SELECT rowid FROM extensions WHERE LOWER(author) = LOWER(?) AND id = ?");
+            const insertFts = db.prepare(
+              "INSERT INTO extensions_fts(rowid, id, name, author, description, search_keywords, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            );
+            const clearBlock = db.prepare("DELETE FROM blocklist");
+            const insertBlock = db.prepare("INSERT OR IGNORE INTO blocklist (id, reason, created_at) VALUES (?, 'Revoked', ?)");
+
+            let nextSeq = startSeq;
+            db.exec("BEGIN TRANSACTION;");
+            try {
+              for (const del of deletedKeys) {
+                const existing = selectExisting.get(del.author, del.id);
+                if (existing) {
+                  deleteFts.run(
+                    existing.rowid,
+                    existing.id,
+                    existing.name || "",
+                    existing.author || "",
+                    existing.description || "",
+                    existing.search_keywords || "",
+                    existing.capabilities || ""
+                  );
+                  deleteExt.run(existing.rowid);
+                  nextSeq++;
+                  deltaMap.set(`${String(existing.author).toLowerCase()}/${existing.id}`, {
+                    seq: nextSeq,
+                    op: "delete",
+                    author: existing.author,
+                    id: existing.id
+                  });
+                }
+              }
+
+              for (const item of changedEntries) {
+                const capsStr = (item.capabilities || []).join(", ");
+                const kwStr = (item.searchKeywords || []).join(", ");
+                const desc = String(item.description || "");
+                const name = String(item.name || "");
+                const id = String(item.id || "");
+                const author = String(item.author || "");
+                const repoField = String(item.repo || "");
+                const releaseTag = String(item.releaseTag || "");
+                const version = String(item.version || "");
+                const hash = String(item.hash || "").trim().toLowerCase();
+                const normalizedHash = String(item.normalizedHash || "").trim().toLowerCase();
+                const filesJson = JSON.stringify(item.files || []);
+                const fileHashesJson = JSON.stringify(item.fileHashes || {});
+                const updatedAt = Number(item.updatedAt || Date.now());
+                const downloads = Number(item.downloads || 0);
+
+                const curFp = rowFingerprint({
+                  name, version, description: desc, repo: repoField,
+                  release_tag: releaseTag, capabilities: capsStr, search_keywords: kwStr,
+                  downloads, hash, normalized_hash: normalizedHash, files: filesJson, file_hashes: fileHashesJson, updated_at: updatedAt
+                });
+
+                const existing = selectExisting.get(author, id);
+                if (existing) {
+                  if (rowFingerprint(existing) === curFp) {
+                    continue;
+                  }
+                  deleteFts.run(
+                    existing.rowid,
+                    existing.id,
+                    existing.name || "",
+                    existing.author || "",
+                    existing.description || "",
+                    existing.search_keywords || "",
+                    existing.capabilities || ""
+                  );
+                }
+
+                upsertExt.run(
+                  id, name, author, version, desc, repoField, releaseTag,
+                  capsStr, kwStr, downloads, hash, normalizedHash, filesJson, fileHashesJson, updatedAt
+                );
+                const row = selectRowId.get(author, id);
+                if (row) {
+                  insertFts.run(row.rowid, id, name, author, desc, kwStr, capsStr);
+                }
+
+                nextSeq++;
+                deltaMap.set(`${author.toLowerCase()}/${id}`, {
+                  seq: nextSeq,
+                  op: "upsert",
+                  id, name, author, version, description: desc, repo: repoField,
+                  release_tag: releaseTag, capabilities: capsStr, search_keywords: kwStr,
+                  downloads, hash, normalized_hash: normalizedHash, files: filesJson, file_hashes: fileHashesJson, updated_at: updatedAt
+                });
+              }
+
+              const now = Date.now();
+              clearBlock.run();
+              for (const blockedId of blocklist) {
+                insertBlock.run(blockedId, now);
+              }
+              db.exec("COMMIT;");
+            } catch (err) {
+              db.exec("ROLLBACK;");
+              throw err;
+            }
+
+            const countRow = db.prepare("SELECT COUNT(*) AS cnt FROM extensions").get();
+            return { nextSeq, totalCount: Number(countRow ? countRow.cnt : 0) };
+          }
+
           async function main() {
             const repo = process.env.REPO_FULL_NAME;
+            const currentCommitSha = getCurrentCommitSha();
+            const isManualDispatch = process.env.EVENT_NAME === "workflow_dispatch";
 
-            // 1. Load previous release artifacts (if any) to track monotonic seq & deltas
             let prevLatestSeq = 0;
             let prevDeltaStartSeq = 1;
+            let prevBuiltCommitSha = "";
             const prevFingerprints = new Map();
             const deltaMap = new Map();
 
@@ -663,6 +983,7 @@ jobs:
                 const pm = JSON.parse(prevMetaBuf.toString("utf-8"));
                 prevLatestSeq = Number(pm.latestSeq || 0);
                 prevDeltaStartSeq = Number(pm.deltaStartSeq || 1);
+                prevBuiltCommitSha = typeof pm.builtCommitSha === "string" ? pm.builtCommitSha.trim() : "";
               } catch (_) {}
             }
 
@@ -686,6 +1007,92 @@ jobs:
               prevSqliteBuf = await downloadPrevAsset(repo, "catalog.sqlite");
             }
 
+            const blocklist = readBlocklist();
+            const dbPath = "catalog.sqlite";
+            if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+
+            // Incremental fast-path: patch prev_catalog.sqlite using only files changed since prevBuiltCommitSha
+            if (prevSqliteBuf && prevBuiltCommitSha && currentCommitSha && !isManualDispatch) {
+              try {
+                fs.writeFileSync(dbPath, prevSqliteBuf);
+                const incDb = new DatabaseSync(dbPath);
+                const cols = incDb.prepare("PRAGMA table_info(extensions)").all().map((c) => c.name);
+                const hasNormHashCol = cols.includes("normalized_hash");
+
+                if (hasNormHashCol) {
+                  let changedFiles = [];
+                  if (prevBuiltCommitSha !== currentCommitSha) {
+                    const headers = {
+                      "User-Agent": "Mirage-Catalog-Builder",
+                      "Accept": "application/vnd.github.v3+json"
+                    };
+                    if (process.env.REPO_TOKEN) {
+                      headers["Authorization"] = `Bearer ${process.env.REPO_TOKEN}`;
+                    }
+                    const cmpRes = await fetch(
+                      `https://api.github.com/repos/${repo}/compare/${encodeURIComponent(prevBuiltCommitSha)}...${encodeURIComponent(currentCommitSha)}`,
+                      { headers }
+                    );
+                    if (!cmpRes.ok) {
+                      throw new Error(`Compare failed: HTTP ${cmpRes.status}`);
+                    }
+                    const cmpData = await cmpRes.json();
+                    changedFiles = Array.isArray(cmpData.files) ? cmpData.files : [];
+                    if (changedFiles.length > 250) {
+                      throw new Error("Large diff (>250 files), falling back to full rebuild.");
+                    }
+                  }
+
+                  const changedEntries = [];
+                  const deletedKeys = [];
+
+                  for (const f of changedFiles) {
+                    if (f.previous_filename && f.previous_filename.startsWith("authors/") && f.previous_filename.endsWith(".json")) {
+                      const prevParts = f.previous_filename.split("/");
+                      if (prevParts.length === 3) {
+                        deletedKeys.push({ author: prevParts[1], id: path.basename(prevParts[2], ".json") });
+                      }
+                    }
+                    const fn = String(f.filename || "").trim();
+                    if (!fn.startsWith("authors/") || !fn.endsWith(".json")) continue;
+                    const parts = fn.split("/");
+                    if (parts.length !== 3) continue;
+
+                    if (f.status === "removed") {
+                      deletedKeys.push({ author: parts[1], id: path.basename(parts[2], ".json") });
+                    } else if (fs.existsSync(fn)) {
+                      try {
+                        changedEntries.push(JSON.parse(fs.readFileSync(fn, "utf-8")));
+                      } catch (_) {}
+                    }
+                  }
+
+                  incDb.exec(`
+                    CREATE INDEX IF NOT EXISTS idx_extensions_hash ON extensions(hash);
+                    CREATE INDEX IF NOT EXISTS idx_extensions_norm_hash ON extensions(normalized_hash);
+                  `);
+                  const { nextSeq, totalCount } = applyIncrementalChanges(
+                    incDb,
+                    changedEntries,
+                    deletedKeys,
+                    blocklist,
+                    deltaMap,
+                    prevLatestSeq
+                  );
+                  incDb.close();
+                  finalizeArtifacts(incDb, dbPath, deltaMap, prevDeltaStartSeq, nextSeq, totalCount, blocklist, currentCommitSha);
+                  return;
+                }
+                incDb.close();
+              } catch (incErr) {
+                console.warn("[build-catalog] Incremental path skipped, falling back to full rebuild:", incErr.message || incErr);
+                if (fs.existsSync(dbPath)) {
+                  try { fs.unlinkSync(dbPath); } catch (_) {}
+                }
+              }
+            }
+
+            // Full rebuild fallback (initial build, schema migration, or workflow_dispatch)
             if (prevSqliteBuf) {
               fs.writeFileSync("prev_catalog.sqlite", prevSqliteBuf);
               try {
@@ -700,7 +1107,6 @@ jobs:
               try { fs.unlinkSync("prev_catalog.sqlite"); } catch (_) {}
             }
 
-            // 2. Read all current authors/<author>/<id>.json entries
             const authorsDir = "authors";
             const registry = [];
             const currentKeys = new Set();
@@ -723,16 +1129,6 @@ jobs:
             }
 
             registry.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-
-            const blocklist = [];
-            if (fs.existsSync("blocklist.txt")) {
-              const lines = fs.readFileSync("blocklist.txt", "utf-8").split("\n").map(l => l.trim()).filter(Boolean);
-              blocklist.push(...lines);
-            }
-
-            // 3. Build catalog.sqlite using prepared statements + compute seq deltas
-            const dbPath = "catalog.sqlite";
-            if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
 
             const db = new DatabaseSync(dbPath);
             db.exec(`
@@ -798,8 +1194,8 @@ jobs:
                 const repoField = String(item.repo || "");
                 const releaseTag = String(item.releaseTag || "");
                 const version = String(item.version || "");
-                const hash = String(item.hash || "");
-                const normalizedHash = String(item.normalizedHash || "");
+                const hash = String(item.hash || "").trim().toLowerCase();
+                const normalizedHash = String(item.normalizedHash || "").trim().toLowerCase();
                 const filesJson = JSON.stringify(item.files || []);
                 const fileHashesJson = JSON.stringify(item.fileHashes || {});
                 const updatedAt = Number(item.updatedAt || Date.now());
@@ -832,7 +1228,6 @@ jobs:
                 }
               }
 
-              // Track removals in delta
               for (const [oldKey, info] of prevFingerprints.entries()) {
                 if (!currentKeys.has(oldKey)) {
                   nextSeq++;
@@ -857,36 +1252,7 @@ jobs:
               db.close();
             }
 
-            // 4. Compress catalog.sqlite -> catalog.sqlite.gz
-            const sqliteBytes = fs.readFileSync(dbPath);
-            const gzSqlite = zlib.gzipSync(sqliteBytes, { level: 9 });
-            fs.writeFileSync("catalog.sqlite.gz", gzSqlite);
-
-            // 5. Sort, cap, and compress catalog-delta.jsonl.gz
-            let deltaList = Array.from(deltaMap.values()).sort((a, b) => a.seq - b.seq);
-            let deltaStartSeq = prevDeltaStartSeq || 1;
-            if (deltaList.length > MAX_DELTA_ENTRIES) {
-              const dropCount = deltaList.length - MAX_DELTA_ENTRIES;
-              const maxDroppedSeq = deltaList[dropCount - 1].seq;
-              deltaList = deltaList.slice(dropCount);
-              deltaStartSeq = Math.max(deltaStartSeq, maxDroppedSeq + 1);
-            }
-            if (nextSeq === 0) deltaStartSeq = 1;
-
-            const deltaText = deltaList.map((d) => JSON.stringify(d)).join("\n") + (deltaList.length ? "\n" : "");
-            fs.writeFileSync("catalog-delta.jsonl.gz", zlib.gzipSync(Buffer.from(deltaText, "utf-8"), { level: 9 }));
-
-            // 6. Write tiny catalog-meta.json
-            const metaObj = {
-              latestSeq: nextSeq,
-              deltaStartSeq,
-              totalCount: registry.length,
-              blocklist,
-              updatedAt: Date.now()
-            };
-            fs.writeFileSync("catalog-meta.json", JSON.stringify(metaObj), "utf-8");
-
-            console.log(`✔ Built catalog.sqlite.gz (${(gzSqlite.length / 1024).toFixed(1)} KB), delta (${deltaList.length} entries), latestSeq=${nextSeq}, deltaStartSeq=${deltaStartSeq}.`);
+            finalizeArtifacts(db, dbPath, deltaMap, prevDeltaStartSeq, nextSeq, registry.length, blocklist, currentCommitSha);
           }
 
           main().catch((err) => {
